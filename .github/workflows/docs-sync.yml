@@ -1,0 +1,87 @@
+name: AI Docs Sync (shared)
+
+on:
+  workflow_call:
+    inputs:
+      target_branch: { type: string,  required: false, default: '' }
+      since:         { type: string,  required: false }
+      dry_run:       { type: boolean, required: false, default: false }
+    secrets:
+      ANTHROPIC_API_KEY: { required: false }
+      OPENAI_API_KEY:    { required: false }
+      DOCS_SYNC_TOKEN:   { required: false }
+
+jobs:
+  sync:
+    # Cheap static pre-filter; the exact target is resolved in the first step. No actor guard: a
+    # human merges the rolling PR, so the loop is caught by the changed-paths check in the tool,
+    # and some legitimate pushes (CMS-generated content PRs) may come from the Actions bot.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.ref_name == inputs.target_branch ||
+      github.ref_name == 'develop' ||
+      github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Job-level, not workflow-level: that is the placement GitHub documents for called workflows.
+    # `github.repository` is the caller's, so the group is per consumer repo.
+    concurrency:
+      group: docs-sync-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      # Resolve the target branch: input > `develop` if it exists > default branch. Exit
+      # (success, no-op) when the pushed branch is not the target, so listing extra branches in
+      # the consumer file costs one API call and nothing else.
+      # Everything from the event goes through env, never into the script text: `${{ }}` inside
+      # `run:` is string substitution before the shell sees it.
+      - id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TARGET: ${{ inputs.target_branch }}
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          t="$INPUT_TARGET"
+          if [ -z "$t" ]; then
+            if gh api "repos/$REPO/branches/develop" >/dev/null 2>&1; then t=develop
+            else t="$DEFAULT_BRANCH"; fi
+          fi
+          case "$t" in *[!A-Za-z0-9._/-]*|-*|*..*) echo "Refusing target branch name: $t"; exit 1;; esac
+          echo "branch=$t" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT_NAME" = push ] && [ "$REF_NAME" != "$t" ]; then
+            echo "skip=1" >> "$GITHUB_OUTPUT"; echo "Pushed $REF_NAME, target is $t; nothing to do."
+          fi
+
+      - if: steps.target.outputs.skip != '1'
+        uses: actions/checkout@v4          # target branch: config, guidelines, docs
+        with:
+          ref: ${{ steps.target.outputs.branch }}
+          fetch-depth: 0                   # needed for ancestry checks, the cursor and git diff
+          # The token is not written into .git/config. The tool authenticates only its own
+          # push, so `setup_command` and prettier never run next to a write credential.
+          persist-credentials: false
+      - if: steps.target.outputs.skip != '1'
+        uses: actions/checkout@v4          # the tool, at the ref the consumer pinned
+        with:
+          repository: acid-info/ai-docs-sync
+          ref: ${{ github.job_workflow_sha }}
+          path: .ai-docs-sync
+          persist-credentials: false
+      - if: steps.target.outputs.skip != '1'
+        uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - if: steps.target.outputs.skip != '1'
+        run: node .ai-docs-sync/docs-sync.mjs
+        env:
+          GITHUB_TOKEN: ${{ secrets.DOCS_SYNC_TOKEN || github.token }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          REPO: ${{ github.repository }}
+          TARGET_BRANCH: ${{ steps.target.outputs.branch }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_FORCED: ${{ github.event.forced }}
+          SINCE: ${{ inputs.since }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
