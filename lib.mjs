@@ -1120,3 +1120,170 @@ export async function mapConcurrent(items, limit, fn) {
   return results;
 }
 
+// --------------------------------------------------------------------- gates ---
+
+const DASH_RE = /[\u2013\u2014]/g;
+const ATTRIBUTION_RE = /co-authored-by|generated (with|by)|🤖/i;
+const VENDOR_RE = /\b(anthropic|openai|claude|chatgpt|gpt-?\d)\b/i;
+const URL_RE = /https?:\/\/[^\s)>\]"']+/g;
+const HTML_TAG_RE = /<\/?[a-zA-Z][^>]*>/g;
+
+export const normaliseContent = (s) =>
+  (s ?? '')
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map((l) => l.trimEnd())
+    .join('\n')
+    .replace(/\n*$/, '\n');
+
+export function gateAllowlist(file, { isEditableDoc }) {
+  const c = canonicalise(file.path);
+  if (!c || c !== file.path || !isEditableDoc(c)) return { ok: false, reason: 'path outside the editable allowlist' };
+  return { ok: true };
+}
+
+export function gateNonEmpty(file, { current }) {
+  if (!file.content || !file.content.trim()) return { ok: false, reason: 'empty output' };
+  if (current != null && normaliseContent(current) === normaliseContent(file.content)) return { ok: false, reason: 'no change' };
+  return { ok: true };
+}
+
+// `existsInTree(path)` answers for the post-edit tree: files created this run plus the checkout.
+export function gateLinks(file, { existsInTree }) {
+  const dir = path.dirname(file.path);
+  const broken = [];
+  for (const l of extractRelativeLinks(file.content)) {
+    const resolved = path.normalize(path.join(dir === '.' ? '' : dir, l));
+    if (resolved.startsWith('..') || !existsInTree(resolved)) broken.push(l);
+  }
+  return broken.length ? { ok: false, reason: `broken relative link(s): ${[...new Set(broken)].join(', ')}` } : { ok: true };
+}
+
+// Measured against the target branch, not the carried draft, so drift cannot creep run by run.
+export function gateSize(file, { target }) {
+  if (file.action === 'create' || target == null) return { ok: true };
+  const before = Buffer.byteLength(target);
+  if (before <= 400) return { ok: true };
+  const after = Buffer.byteLength(file.content);
+  if (after < before * 0.5) return { ok: false, reason: `shrank ${Math.round((1 - after / before) * 100)}% (${before} -> ${after} bytes)` };
+  if (after > before * 3) return { ok: false, reason: `grew ${(after / before).toFixed(1)}x (${before} -> ${after} bytes)` };
+  return { ok: true };
+}
+
+// Fixes dashes on lines this run added or changed, drops on attribution. Returns new content.
+export function gateStyle(file, { current }) {
+  const lines = file.content.split('\n');
+  const added = addedLineIndexes(lineDiff(current ?? '', file.content));
+  let fixed = 0;
+  for (const i of added) {
+    if (/[\u2013\u2014]/.test(lines[i])) {
+      lines[i] = lines[i].replace(DASH_RE, '--');
+      fixed++;
+    }
+    if (ATTRIBUTION_RE.test(lines[i])) return { ok: false, reason: `attribution string on line ${i + 1}` };
+  }
+  return { ok: true, content: lines.join('\n'), fixed };
+}
+
+// Reviewer attention flags: never blocking.
+export function gateFlags(file, { current, isGuideline }) {
+  const flags = [];
+  const before = current ?? '';
+  const ops = lineDiff(before, file.content);
+  const added = addedLineIndexes(ops);
+  const lines = file.content.split('\n');
+  const oldUrls = new Set(before.match(URL_RE) ?? []);
+  const newUrls = new Set();
+  const newTags = new Set();
+  const vendors = new Set();
+  for (const i of added) {
+    const line = lines[i];
+    for (const u of line.match(URL_RE) ?? []) if (!oldUrls.has(u)) newUrls.add(u);
+    const noComments = line.replace(/<!--[\s\S]*?-->/g, '');
+    for (const t of noComments.match(HTML_TAG_RE) ?? []) {
+      if (/^<a\s+(name|id)=/i.test(t) || /^<\/a>$/i.test(t)) continue;
+      newTags.add(t);
+    }
+    const v = line.match(VENDOR_RE);
+    if (v) vendors.add(v[0]);
+  }
+  if (newUrls.size) flags.push({ kind: 'new_urls', detail: [...newUrls] });
+  if (newTags.size) flags.push({ kind: 'raw_html', detail: [...newTags] });
+  if (vendors.size) flags.push({ kind: 'vendor_names', detail: [...vendors] });
+  if (isGuideline) flags.push({ kind: 'guideline_edit', detail: unifiedDiff(before, file.content, file.path) });
+  return { ok: true, flags };
+}
+
+// `format.run(content, path)` returns { ok, content } or { ok: false, error }.
+export function gateFormat(file, { format }) {
+  if (!format || format.mode !== 'strict') return { ok: true, content: file.content };
+  const r = format.run(file.content, file.path);
+  if (!r.ok) return { ok: false, reason: `prettier failed: ${r.error}` };
+  return { ok: true, content: r.content };
+}
+
+// Runs gates 0-6 in order. Gates 0 and 1 run first for every file so the link gate can see the
+// post-edit tree (files created this run are only "there" once they passed 0 and 1); no fixpoint.
+export function runGates(files, ctx) {
+  const { isEditableDoc, readCurrent, readTarget, existsInCheckout, guidelineFiles, format } = ctx;
+  const kept = [];
+  const dropped = [];
+  const drop = (f, gate, reason) => dropped.push({ path: f.path, gate, reason });
+
+  const stage1 = [];
+  for (const f of files) {
+    let r = gateAllowlist(f, { isEditableDoc });
+    if (!r.ok) {
+      drop(f, 0, r.reason);
+      continue;
+    }
+    const current = readCurrent(f.path);
+    r = gateNonEmpty(f, { current });
+    if (!r.ok) {
+      drop(f, 1, r.reason);
+      continue;
+    }
+    stage1.push({ ...f, current });
+  }
+  const created = new Set(stage1.map((f) => f.path));
+  const existsInTree = (p) => created.has(p) || existsInCheckout(p);
+
+  for (const f of stage1) {
+    let r = gateLinks(f, { existsInTree });
+    if (!r.ok) {
+      drop(f, 2, r.reason);
+      continue;
+    }
+    r = gateSize(f, { target: readTarget(f.path) });
+    if (!r.ok) {
+      drop(f, 3, r.reason);
+      continue;
+    }
+    r = gateStyle(f, { current: f.current });
+    if (!r.ok) {
+      drop(f, 4, r.reason);
+      continue;
+    }
+    const styled = { ...f, content: r.content, dashesFixed: r.fixed };
+    const flags = gateFlags(styled, { current: f.current, isGuideline: isGuidelineFile(f.path, guidelineFiles ?? new Set()) }).flags;
+    r = gateFormat(styled, { format });
+    if (!r.ok) {
+      drop(f, 6, r.reason);
+      continue;
+    }
+    kept.push({ ...styled, content: r.content, flags });
+  }
+  return { kept, dropped };
+}
+
+// -------------------------------------------------------------------- defuse ---
+
+// Anything model- or narrative-derived that reaches GitHub text: no live @mentions, no closing
+// keywords that would close an issue when the docs PR merges, bounded length.
+export function defuse(s, max = 300) {
+  let t = String(s ?? '').replace(/\s+/g, ' ').trim();
+  if (t.length > max) t = t.slice(0, max - 1) + '…';
+  return t
+    .replace(/@(?=[A-Za-z\d_/-])/g, '@\u200b')
+    .replace(/\b(close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)(\s+)#(?=\d)/gi, '$1$2#\u200b');
+}
