@@ -9,8 +9,12 @@ Humans merge it.
 Consumers call this repo as a **reusable workflow** pinned to `@v1`. Upgrading the tool or
 swapping a model is one edit here, not one per consumer.
 
-> **Status: scaffold.** The workflow, entry point and test harness exist; none of the stages
-> below are implemented yet. Do not add this to a repo until `v1` is tagged.
+> **Status: not yet publishing.** Everything up to and including the mechanical gates is
+> implemented and unit-tested (config, allowlist, cursor range, narrative, diff packing,
+> manifest, carry-forward read side, triage, writer, checker, correction, gates 0-6). The
+> publishing stage (branch rebuild, push, rolling PR, cursor move, PR body) is not: a run stops
+> after the gates, prints what it would push and exits 1 unless `DRY_RUN=1`. Do not add this to
+> a repo until `v1` is tagged.
 
 ## How it works
 
@@ -189,10 +193,25 @@ That is what CI runs. `test/` imports `lib.mjs` only; `lib.mjs` has no side effe
 time and never reads `process.env` or touches the network. `docs-sync.mjs` is the only file that
 does.
 
-Once the stages exist: `DRY_RUN=1` prints the would-be PR instead of pushing it (the model calls
-still run and are paid for); `TRIAGE_ONLY=1` stops after triage; a junk API key proves config and
-diff handling for free, since everything before the first model call runs and then the run dies
-at a 401.
+To run the tool itself, `cd` into a full clone of the consumer repo checked out at its target
+branch (the config is read from `.github/docs-sync.yml` there) and set the env the workflow
+would:
+
+```bash
+GITHUB_TOKEN=$(gh auth token) REPO=owner/name TARGET_BRANCH=develop SINCE=<sha> \
+  ANTHROPIC_API_KEY=sk-ant-junk TRIAGE_ONLY=1 node /path/to/ai-docs-sync/docs-sync.mjs
+```
+
+| Env | Effect |
+| --- | --- |
+| `SINCE` | Start of the diff range; must be an ancestor of the target head. Skips the cursor read. |
+| `TRIAGE_ONLY=1` | Stops after triage. With a junk API key everything free runs (range, changed files, narrative, packed diff, manifest, guidelines) and the run dies at a 401 having spent nothing. |
+| `DRY_RUN=1` | Runs the model calls and gates (paid), prints the surviving diffs, exits 0 without pushing. |
+| `DEBUG=1` | Logs every model's raw output and stack traces to stderr. |
+| `PUSH_BEFORE`, `PUSH_FORCED` | What the workflow passes from the push event; used only when there is no cursor ref. |
+
+`GITHUB_TOKEN` is needed for read-only calls even locally: the cursor ref, the default branch and
+the commit-to-PR lookups that build the change narrative.
 
 The reusable workflow itself has no runnable form without a caller: `workflow_call` cannot be
 dispatched directly. End-to-end changes have to be proved on a real push in a consumer repo.
