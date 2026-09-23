@@ -87,8 +87,9 @@ export const BUILT_IN_IGNORE = [
   '**/*.generated.*',
 ];
 
-// Never writable, whatever doc_paths says.
-export const DENYLIST = ['.github/**', '.git/**', '**/node_modules/**'];
+// Never writable, whatever doc_paths says. `.ai-docs-sync/` is where the workflow checks out this
+// tool inside the consumer's tree.
+export const DENYLIST = ['.github/**', '.git/**', '**/node_modules/**', '.ai-docs-sync/**'];
 
 // $/MTok. Cache reads are billed at a tenth of input, cache writes at 1.25x.
 export const PRICES = {
@@ -1432,8 +1433,6 @@ export function gitAuthEnv(token) {
     GIT_TERMINAL_PROMPT: '0',
   };
 }
-
-export const isPrCreateForbidden = (status, text) => status === 403 && /not permitted to create or approve pull requests|pull request/i.test(text ?? '');
 
 const MARKER_RE = /<!-- ai-docs-sync (\{[\s\S]*?\}) -->/;
 

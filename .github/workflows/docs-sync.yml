@@ -84,4 +84,6 @@ jobs:
           PUSH_FORCED: ${{ github.event.forced }}
           SINCE: ${{ inputs.since }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+          # "Re-run with debug logging" also logs every model's raw output.
+          DEBUG: ${{ runner.debug }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
