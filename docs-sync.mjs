@@ -1,13 +1,419 @@
 #!/usr/bin/env node
-// Entry point: env parsing and stage orchestration. Everything pure lives in lib.mjs.
+// Entry point: env parsing and stage orchestration. Everything pure lives in lib.mjs; this is the
+// only file that reads process.env, runs git or touches the network.
+//
+// Env: GITHUB_TOKEN, REPO ("owner/name"), TARGET_BRANCH, ANTHROPIC_API_KEY and/or OPENAI_API_KEY.
+// Optional: PUSH_BEFORE, PUSH_FORCED, SINCE, DRY_RUN, TRIAGE_ONLY, DEBUG, RUN_URL.
+// Runs from the target-branch checkout with full history (fetch-depth: 0).
 
-import { VERSION } from './lib.mjs';
+import { execFileSync, execSync } from 'node:child_process';
+import { existsSync, readFileSync, readdirSync, lstatSync } from 'node:fs';
+import { join } from 'node:path';
+import * as L from './lib.mjs';
 
-async function main() {
-  console.log(`ai-docs-sync ${VERSION}: not implemented yet.`);
+const {
+  GITHUB_TOKEN,
+  ANTHROPIC_API_KEY,
+  OPENAI_API_KEY,
+  REPO,
+  TARGET_BRANCH,
+  PUSH_BEFORE,
+  PUSH_FORCED,
+  SINCE,
+  RUN_URL,
+} = process.env;
+const truthy = (v) => /^(1|true|yes)$/i.test(v ?? '');
+const DRY_RUN = truthy(process.env.DRY_RUN);
+const TRIAGE_ONLY = truthy(process.env.TRIAGE_ONLY);
+const DEBUG = truthy(process.env.DEBUG);
+const ROOT = process.cwd();
+
+const log = (m) => console.log(m);
+const warn = (m) => console.warn(`[warn] ${m}`);
+const debug = (label, text) => {
+  if (DEBUG) console.error(`[debug] ${label}:\n${text}\n[debug] end ${label}`);
+};
+
+// ---------------------------------------------------------------------- helpers ---
+
+function git(args, { quiet = false, input } = {}) {
+  return execFileSync('git', args, {
+    cwd: ROOT,
+    encoding: 'utf8',
+    maxBuffer: 512 * 1024 * 1024,
+    input,
+    stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', quiet ? 'ignore' : 'inherit'],
+  }).replace(/\n$/, '');
+}
+const gitOk = (args) => {
+  try {
+    git(args, { quiet: true });
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+async function gh(path, { allow404 = false, ...opts } = {}) {
+  const res = await fetch(`${L.API.github.baseUrl}${path}`, {
+    ...opts,
+    headers: {
+      Authorization: `Bearer ${GITHUB_TOKEN}`,
+      Accept: L.API.github.accept,
+      'X-GitHub-Api-Version': L.API.github.version,
+      ...(opts.body ? { 'Content-Type': 'application/json' } : {}),
+      ...opts.headers,
+    },
+    signal: AbortSignal.timeout(60_000),
+  });
+  if (res.status === 404 && allow404) return null;
+  if (!res.ok) throw new Error(`GitHub ${path} -> ${res.status}: ${await res.text()}`);
+  return res.status === 204 ? null : res.json();
 }
 
+async function ghAll(path) {
+  const out = [];
+  for (let page = 1; ; page++) {
+    const batch = await gh(`${path}${path.includes('?') ? '&' : '?'}per_page=100&page=${page}`);
+    out.push(...batch);
+    if (batch.length < 100) break;
+  }
+  return out;
+}
+
+const readCheckout = (p) => (existsSync(join(ROOT, p)) ? readFileSync(join(ROOT, p), 'utf8') : null);
+
+// Walks the checkout for editable docs; symlinked directories are never entered.
+function walkDocs(isEditableDoc, dir = '') {
+  const out = [];
+  for (const name of readdirSync(join(ROOT, dir))) {
+    if (name === '.git' || name === 'node_modules') continue;
+    const rel = dir ? `${dir}/${name}` : name;
+    const st = lstatSync(join(ROOT, rel));
+    if (st.isSymbolicLink()) continue;
+    if (st.isDirectory()) out.push(...walkDocs(isEditableDoc, rel));
+    else if (st.isFile() && isEditableDoc(rel)) out.push(rel);
+  }
+  return out;
+}
+
+function makeFormatter(cfg) {
+  if (cfg.format_check !== 'strict') return { mode: 'off' };
+  log(`Running setup_command for format_check: strict`);
+  execSync(cfg.setup_command, { cwd: ROOT, stdio: 'inherit', env: { ...process.env, GITHUB_TOKEN: '', ANTHROPIC_API_KEY: '', OPENAI_API_KEY: '' } });
+  const prettier = join(ROOT, 'node_modules', '.bin', 'prettier');
+  if (!existsSync(prettier)) throw new Error('format_check: strict but node_modules/.bin/prettier is missing after setup_command');
+  return {
+    mode: 'strict',
+    run: (content, filePath) => {
+      try {
+        const out = execFileSync(prettier, ['--stdin-filepath', filePath], { cwd: ROOT, encoding: 'utf8', input: content, stdio: ['pipe', 'pipe', 'pipe'] });
+        return { ok: true, content: out };
+      } catch (e) {
+        return { ok: false, error: (e.stderr || e.message || '').toString().trim().split('\n')[0] };
+      }
+    },
+  };
+}
+
+// ------------------------------------------------------------------------- main ---
+
+async function main() {
+  const missing = [
+    ['GITHUB_TOKEN', GITHUB_TOKEN],
+    ['REPO', REPO],
+    ['TARGET_BRANCH', TARGET_BRANCH],
+  ]
+    .filter(([, v]) => !v)
+    .map(([k]) => k);
+  if (!ANTHROPIC_API_KEY && !OPENAI_API_KEY) missing.push('ANTHROPIC_API_KEY or OPENAI_API_KEY');
+  if (missing.length) throw new Error(`Missing required env var(s): ${missing.join(', ')}`);
+
+  const models = L.pickModels({ anthropic: ANTHROPIC_API_KEY, openai: OPENAI_API_KEY });
+  const usage = L.makeUsageLog(log, warn);
+
+  // 5.1 config, allowlist, guidelines
+  const cfgPath = join(ROOT, '.github', 'docs-sync.yml');
+  if (!existsSync(cfgPath)) throw new Error('.github/docs-sync.yml not found on the target branch');
+  const cfg = L.loadConfig(readFileSync(cfgPath, 'utf8'), { warn });
+  const isEditableDocPath = L.makeIsEditableDocPath(cfg);
+  const isEditableDoc = L.makeIsEditableDoc(cfg, ROOT);
+  const isIgnored = L.makeMatcher(cfg.ignore);
+
+  let defaultBranch = '';
+  try {
+    defaultBranch = (await gh(`/repos/${REPO}`)).default_branch ?? '';
+  } catch (e) {
+    warn(`could not read the default branch (${e.message}); rolling branch checked against the target only`);
+  }
+  L.validateRollingBranch(cfg.branch, { targetBranch: TARGET_BRANCH, defaultBranch });
+
+  const head = git(['rev-parse', 'HEAD']);
+  log(`ai-docs-sync ${L.VERSION}: ${REPO} target ${TARGET_BRANCH} at ${head.slice(0, 7)}` + (DRY_RUN ? ' (dry run)' : '') + (TRIAGE_ONLY ? ' (triage only)' : ''));
+
+  // 5.2 range: cursor ref, then PUSH_BEFORE, then HEAD~1; SINCE overrides all
+  let cursor = null;
+  if (!SINCE) {
+    const ref = await gh(`/repos/${REPO}/git/ref/ai-docs-sync/cursor`, { allow404: true });
+    cursor = ref?.object?.sha ?? null;
+    log(cursor ? `Cursor ref at ${cursor.slice(0, 7)}` : 'No cursor ref yet');
+  }
+  const isAncestor = (sha) => gitOk(['rev-parse', '--verify', '--quiet', `${sha}^{commit}`]) && gitOk(['merge-base', '--is-ancestor', sha, 'HEAD']);
+  const range = L.selectRange({ since: SINCE, cursor, pushBefore: PUSH_BEFORE, pushForced: PUSH_FORCED }, isAncestor);
+  if (range.from === 'HEAD~1' && !gitOk(['rev-parse', '--verify', '--quiet', 'HEAD~1'])) {
+    log('Single-commit history; nothing to compare. (cursor not moved: publishing is phase 4)');
+    return;
+  }
+  let from = git(['rev-parse', range.from]);
+  let capped = false;
+  const count = Number(git(['rev-list', '--count', `${from}..HEAD`]));
+  if (count > cfg.max_commits) {
+    const shas = git(['rev-list', `--max-count=${cfg.max_commits + 1}`, 'HEAD']).split('\n');
+    from = shas[shas.length - 1];
+    capped = true;
+    log(`Range has ${count} commits; capped at the newest ${cfg.max_commits} (from ${from.slice(0, 7)}). Backfill in slices with since=.`);
+  }
+  log(`Range ${from.slice(0, 7)}..${head.slice(0, 7)} (${range.source}, ${Math.min(count, cfg.max_commits)} commits)`);
+  if (from === head) {
+    log('Empty range; nothing to do. (cursor not moved: publishing is phase 4)');
+    return;
+  }
+
+  // 5.4 changed files and free exits
+  const changes = L.parseNameStatus(git(['diff', '--name-status', '-z', '-M', `${from}..HEAD`]));
+  const classified = L.classifyChanges(changes, { isEditableDoc, isIgnored });
+  log(`Changed files: ${changes.length} (${classified.docs.length} docs, ${classified.code.length} code, ${classified.ignored.length} ignored)`);
+  for (const c of changes) log(`  ${c.status} ${c.oldPath ? `${c.oldPath} -> ` : ''}${c.path}`);
+  if (classified.skipReason) {
+    log(`Skip: ${classified.skipReason}. (cursor not moved: publishing is phase 4)`);
+    return;
+  }
+  const changedPaths = changes.map((c) => c.path);
+
+  // 5.3 narrative
+  const commits = L.parseGitLog(git(['log', '--reverse', `--format=${L.GIT_LOG_FORMAT}`, `${from}..HEAD`]));
+  const api = {
+    pr: (n) => gh(`/repos/${REPO}/pulls/${n}`),
+    pullsForCommit: (sha) => gh(`/repos/${REPO}/commits/${sha}/pulls`),
+    prCommits: async (n) =>
+      (await ghAll(`/repos/${REPO}/pulls/${n}/commits`)).map((c) => ({
+        sha: c.sha,
+        subject: (c.commit?.message ?? '').split('\n')[0],
+        email: c.commit?.author?.email ?? '',
+      })),
+  };
+  const { linked, prs, lookups, lookupsExhausted } = await L.collectPrs(commits, api, {
+    targetBranch: TARGET_BRANCH,
+    rollingBranch: cfg.branch,
+    maxLookups: cfg.max_pr_lookups,
+  });
+  if (lookupsExhausted) warn(`PR lookup cap (${cfg.max_pr_lookups}) reached; remaining commits listed as not from a PR`);
+  const narrative = L.buildNarrative({ commits, linked, prs, targetBranch: TARGET_BRANCH, from, to: head, budget: cfg.narrative_max_tokens, capped });
+  log(`Narrative: ${commits.length} commits, ${prs.size} PRs (${lookups} lookups), ~${L.approxTokens(narrative)} tokens`);
+  log(`\n${narrative}\n`);
+
+  // 5.5 packed code diff from local git: one diff for the range, filtered to code files, so a
+  // large push never turns into an oversized argument list.
+  const codeSet = new Set(classified.code.map((c) => c.path));
+  const patches = L.splitUnifiedDiff(git(['diff', '-M', `${from}..HEAD`])).filter((p) => codeSet.has(p.path));
+  const packed = L.packDiff(patches, cfg.max_diff_tokens);
+  log(`Packed diff: ${packed.included.length} files, ~${L.approxTokens(packed.diff)} tokens` + (packed.omitted.length ? `, ${packed.omitted.length} over budget` : ''));
+
+  // 5.12 step 1, read side: carried-forward edits from the rolling branch overlay the checkout
+  const carried = new Map();
+  const staleCarried = [];
+  const remote = `refs/remotes/origin/${cfg.branch}`;
+  if (gitOk(['rev-parse', '--verify', '--quiet', remote])) {
+    const base = git(['merge-base', 'HEAD', remote]);
+    const branchCommits = L.parseGitLog(git(['log', `--format=${L.GIT_LOG_FORMAT}`, `${base}..${remote}`]));
+    if (!L.allOwnCommits(branchCommits))
+      throw new Error(`origin/${cfg.branch} has commits not authored by the tool; refusing to build on it. Rename or delete that branch.`);
+    const plan = L.planCarryForward({
+      branchFiles: git(['diff', '--name-only', base, remote]).split('\n').filter(Boolean),
+      targetChangedSinceBase: (f) => !gitOk(['diff', '--quiet', base, 'HEAD', '--', f]),
+      isEditableDoc,
+    });
+    for (const f of plan.restore) carried.set(f, git(['show', `${remote}:${f}`]));
+    staleCarried.push(...plan.stale);
+    log(`Carrying forward ${plan.restore.length} unmerged edit(s) from origin/${cfg.branch}` + (plan.stale.length ? `; ${plan.stale.length} stale (target changed): ${plan.stale.join(', ')}` : ''));
+  }
+  const readCurrent = (p) => (carried.has(p) ? carried.get(p) : readCheckout(p));
+
+  // 5.6 manifest
+  const docPaths = [...new Set([...walkDocs(isEditableDoc), ...carried.keys()])];
+  const manifest = L.buildManifest(docPaths.map((p) => ({ path: p, content: readCurrent(p) })));
+  const manifestText = L.renderManifest(manifest);
+  log(`Manifest: ${manifest.length} editable docs\n${manifestText}\n`);
+
+  const guidelines = L.loadGuidelines(cfg, ROOT, changedPaths, readCheckout, { log, warn });
+  const guidelineFiles = L.guidelineFileSet(cfg, ROOT);
+
+  // ----------------------------------------------------------- paid stages ---
+
+  const callModel = async (spec, label, { system, blocks, maxTokens, stream = false }) => {
+    const apiKey = spec.provider === 'anthropic' ? ANTHROPIC_API_KEY : OPENAI_API_KEY;
+    const fn = spec.provider === 'anthropic' ? L.anthropicCall : L.openaiCall;
+    const r = await fn({ fetch, apiKey, model: spec.model, system, blocks, maxTokens, effort: spec.effort, stream });
+    usage.log(label, spec.model, r.usage);
+    debug(`${label} raw output`, r.text);
+    if (/max_tokens|length/.test(String(r.stopReason))) warn(`${label}: output cut off by the token budget (stop_reason=${r.stopReason})`);
+    return r;
+  };
+
+  // 5.7 triage
+  const prefix = L.writerPrefix({ guidelines: guidelines.text, narrative, diff: packed.diff, manifest: manifestText });
+  const triageRaw = await callModel(models.triage, 'triage', { system: L.TRIAGE_SYSTEM, blocks: [{ text: prefix }], maxTokens: cfg.response_max_tokens });
+  const triage = L.parseTriage(triageRaw.text, { isEditableDocPath, exists: (p) => readCurrent(p) != null, maxDocs: cfg.max_docs_per_run });
+  if (!triage) throw new Error('triage returned unparseable output (run with DEBUG=1 to see it)');
+  for (const d of triage.dropped) warn(`triage named "${d.path}": ${d.reason}; dropped`);
+  log(`Triage: ${triage.affected.length} affected` + (triage.overflow.length ? `, ${triage.overflow.length} over max_docs_per_run` : '') + (triage.deleteCandidates.length ? `, ${triage.deleteCandidates.length} delete candidate(s)` : ''));
+  for (const a of triage.affected) log(`  ${a.action} ${a.path}: ${a.reason}${a.source_files.length ? ` [${a.source_files.join(', ')}]` : ''}`);
+  for (const a of triage.overflow) log(`  (not this run) ${a.path}: ${a.reason}`);
+  for (const d of triage.deleteCandidates) log(`  delete candidate ${d.path}: ${d.reason}`);
+  if (!triage.affected.length) log(`  ${triage.unaffectedReason || 'no reason given'}`);
+  if (TRIAGE_ONLY) {
+    log(`TRIAGE_ONLY set; stopping. ${costLine(usage)}`);
+    return;
+  }
+  if (!triage.affected.length) {
+    log(`No docs affected; nothing to write. (cursor not moved: publishing is phase 4) ${costLine(usage)}`);
+    return;
+  }
+
+  // 5.8 writer, one call per doc, cached prefix, concurrency of three
+  const heldBack = [];
+  const patchByPath = new Map(patches.map((p) => [p.path, p]));
+  const writable = triage.affected.filter((a) => {
+    const current = readCurrent(a.path);
+    if (current != null && L.approxTokens(current) > cfg.max_doc_tokens) {
+      heldBack.push({ path: a.path, reason: 'too large for a full rewrite in v1' });
+      return false;
+    }
+    return true;
+  });
+  const docPart = (a) =>
+    L.writerDocPart({
+      path: a.path,
+      action: a.action,
+      reason: a.reason,
+      sourcePatches: a.source_files.map((f) => patchByPath.get(f)?.patch).filter(Boolean).join('\n\n'),
+      current: readCurrent(a.path) ?? '',
+    });
+  const writeDoc = async (a, extra = '') => {
+    const r = await callModel(models.writer, `writer ${a.path}`, {
+      system: L.WRITER_SYSTEM,
+      blocks: [{ text: prefix, cache: true }, { text: docPart(a) + extra }],
+      maxTokens: cfg.writer_max_tokens,
+      stream: models.writer.provider === 'anthropic',
+    });
+    return L.parseWriterOutput(r.text);
+  };
+  // The first call alone warms the cached prefix; the rest run three at a time against it.
+  const drafts = [];
+  const written = writable.length ? [await writeDoc(writable[0])] : [];
+  written.push(...(await L.mapConcurrent(writable.slice(1), cfg.writer_concurrency, (a) => writeDoc(a))));
+  writable.forEach((a, i) => {
+    if (written[i] == null) heldBack.push({ path: a.path, reason: 'writer output could not be parsed as a fenced file' });
+    else drafts.push({ ...a, content: written[i], current: readCurrent(a.path) });
+  });
+  log(`Writer: ${drafts.length} draft(s)` + (heldBack.length ? `, ${heldBack.length} held back` : ''));
+
+  // 5.9 checker, then at most one correction per file
+  let checked = null;
+  if (drafts.length) {
+    try {
+      const r = await callModel(models.checker, 'checker', {
+        system: L.CHECKER_SYSTEM,
+        blocks: [
+          {
+            text: L.checkerUser({
+              narrative,
+              diff: packed.diff,
+              docs: drafts.map((d) => ({ ...d, editDiff: L.unifiedDiff(d.current ?? '', d.content, d.path) })),
+            }),
+          },
+        ],
+        maxTokens: cfg.response_max_tokens,
+      });
+      checked = L.parseChecker(r.text);
+      if (!checked) warn('checker returned unparseable output; proceeding unchecked');
+    } catch (e) {
+      warn(`checker failed (${e.message}); proceeding unchecked`);
+    }
+  }
+  const toCorrect = [];
+  const candidates = [];
+  for (const d of drafts) {
+    const decision = L.decideAfterCheck(checked?.get(d.path));
+    const entry = { ...d, check: decision };
+    if (decision.action === 'drop') heldBack.push({ path: d.path, reason: `checker: drop (${decision.issues.map((i) => i.note).join('; ')})` });
+    else if (decision.action === 'correct') toCorrect.push(entry);
+    else candidates.push(entry);
+  }
+  if (toCorrect.length) {
+    log(`Correction pass for ${toCorrect.length} file(s)`);
+    const corrected = await L.mapConcurrent(toCorrect, cfg.writer_concurrency, (d) => writeDoc(d, '\n\n' + L.correctionPart({ draft: d.content, issues: d.check.issues })));
+    toCorrect.forEach((d, i) => {
+      if (corrected[i] == null) warn(`correction for ${d.path} unparseable; keeping the first draft`);
+      candidates.push({ ...d, content: corrected[i] ?? d.content, corrected: corrected[i] != null });
+    });
+  }
+
+  // 5.10 gates
+  const format = candidates.length ? makeFormatter(cfg) : { mode: 'off' };
+  const { kept, dropped } = L.runGates(candidates, {
+    isEditableDoc,
+    readCurrent,
+    readTarget: readCheckout,
+    // Carried-forward creates live on the rolling branch only, so links to them must resolve.
+    existsInCheckout: (p) => carried.has(p) || existsSync(join(ROOT, p)),
+    guidelineFiles,
+    format,
+  });
+
+  // ------------------------------------------------------------- summary ---
+
+  log('\n===== RESULT =====');
+  log(`Range ${from.slice(0, 7)}..${head.slice(0, 7)} on ${TARGET_BRANCH}; rolling branch ${cfg.branch}`);
+  for (const k of kept) {
+    const notes = [];
+    if (k.check?.unchecked) notes.push('unchecked');
+    else if (k.corrected) notes.push(`corrected after: ${k.check.issues.map((i) => `[${i.severity}] ${i.note}`).join('; ')}`);
+    else if (k.check?.issues?.length) notes.push(`checker notes: ${k.check.issues.map((i) => `[${i.severity}] ${i.note}`).join('; ')}`);
+    if (k.dashesFixed) notes.push(`${k.dashesFixed} dash line(s) fixed`);
+    log(`KEEP ${k.action} ${k.path} -- ${k.reason}` + (notes.length ? `\n     ${notes.join('\n     ')}` : ''));
+    for (const f of k.flags) {
+      if (f.kind === 'guideline_edit') log(`     FLAG guideline file edited; full diff:\n${f.detail.replace(/^/gm, '       ')}`);
+      else log(`     FLAG ${f.kind}: ${f.detail.join(', ')}`);
+    }
+  }
+  for (const d of dropped) log(`DROP ${d.path} -- gate ${d.gate}: ${d.reason}`);
+  for (const h of heldBack) log(`HELD ${h.path} -- ${h.reason}`);
+  for (const s of staleCarried) log(`STALE carried edit dropped, target changed ${s}; re-run with since= to regenerate`);
+  for (const a of triage.overflow) log(`ALSO likely affected, not edited this run: ${a.path}`);
+  for (const d of triage.deleteCandidates) log(`DELETE candidate (never acted on): ${d.path} -- ${d.reason}`);
+  if (carried.size) log(`CARRIED forward from earlier runs: ${[...carried.keys()].join(', ')}`);
+  if (packed.omitted.length) log(`DIFF over budget, not shown to the models: ${packed.omitted.join(', ')}`);
+  log(costLine(usage));
+
+  if (DRY_RUN) {
+    log('\n===== DRY RUN -- diffs that would be pushed =====');
+    for (const k of kept) log(`\n${L.unifiedDiff(k.current ?? '', k.content, k.path) || `(no textual diff for ${k.path})`}`);
+  }
+
+  if (!kept.length) {
+    log('Nothing survived the gates. (cursor not moved: publishing is phase 4)');
+    return;
+  }
+  log(`\n${kept.length} file(s) ready. Publishing (branch rebuild, push, PR, cursor) is not implemented yet: phase 4.` + (RUN_URL ? ` Run: ${RUN_URL}` : ''));
+  if (!DRY_RUN) process.exitCode = 1;
+}
+
+const costLine = (usage) =>
+  `[cost] TOTAL ~$${usage.total().toFixed(4)}` + (usage.unpriced().length ? ` (excludes unpriced model(s): ${usage.unpriced().join(', ')})` : '');
+
 main().catch((err) => {
-  console.error(err);
+  console.error(err instanceof Error ? err.message : err);
+  if (DEBUG && err?.stack) console.error(err.stack);
   process.exit(1);
 });
