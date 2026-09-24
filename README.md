@@ -95,7 +95,8 @@ Pass the secrets explicitly. Do **not** use `secrets: inherit`: the tool has no 
 an `NPM_TOKEN` or a database URL.
 
 `@v1` is a moving tag. A consumer that wants immutability pins the commit SHA instead; the
-reusable workflow checks itself out at `github.job_workflow_sha` either way.
+reusable workflow checks itself out at `job.workflow_sha` either way, and refuses to run if
+that is empty.
 
 ### Secrets
 
