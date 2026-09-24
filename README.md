@@ -182,16 +182,18 @@ with the full diff inline. A repo that wants them hand-maintained lists them in 
   branch state the tool inspected.
 - **Carry-forward.** While a PR from the rolling branch into the target is open, its edits are
   carried into the next run. If the target has since changed one of those files, that edit is
-  dropped and the PR body says how to regenerate it (`since=<sha>`). After the PR is merged or
-  closed nothing is carried: merged edits are already in the target, and closing means "not
-  now". The next publishing run opens a fresh PR on the same branch.
+  discarded and the file goes back to triage together with the earlier code changes the edit
+  documented. Triage can select it again, in which case the edit is redone on top of the
+  target's new version. Either way the PR is updated, so it never keeps a conflicting edit. After
+  the PR is merged or closed nothing is carried: merged edits are already in the target, and
+  closing means "not now". The next publishing run opens a fresh PR on the same branch.
 - **Ownership.** If the branch holds a commit the tool did not make, the run refuses before any
   paid call. Rename or delete that branch.
 - The PR body lists, per file: the triage reason, the checker's verdict and issues, and whether
-  a correction pass addressed them. It also lists carried and stale edits, held-back files and
-  the gate that stopped them, new URLs and raw HTML, delete candidates, triage overflow, the
-  change narrative's headings, and API cost. A guideline-file edit is bannered at the top with
-  its full diff.
+  a correction pass addressed them. It also lists carried edits, discarded edits and whether
+  they were redone, held-back files and the gate that stopped them, new links and raw HTML,
+  delete candidates, triage overflow, the commits and PRs in the range, and API cost. A
+  guideline-file edit is bannered at the top with its full diff.
 - Everything model- or narrative-derived in the body is defused: no live `@mentions`, no
   closing keywords, no raw HTML. The body is capped at 60,000 characters. A hidden
   `<!-- ai-docs-sync {...} -->` marker keeps the last 20 runs; it is informational only and

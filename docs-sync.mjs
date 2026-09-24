@@ -285,6 +285,35 @@ async function main() {
     }
   }
   const readCurrent = (p) => (carried.has(p) ? carried.get(p).content : readCheckout(p));
+  const prevRuns = L.parseMarker(openPr?.body);
+  // The PR must stop showing a discarded edit even when nothing else changes this run.
+  const mustRefresh = Boolean(openPr && staleCarried.length);
+
+  // Discarded edits go back to triage with the earlier code changes they documented. Where that
+  // range starts comes from the PR marker, so it is only trusted once git confirms the ancestry.
+  let staleText = '';
+  const earlierByPath = new Map();
+  if (staleCarried.length) {
+    const starts = staleCarried.map((p) => {
+      const s = L.regenerateFrom(prevRuns, p, carryBase);
+      return s && isAncestor(s) ? s : carryBase;
+    });
+    const earliest = starts.sort((a, b) => Number(git(['rev-list', '--count', `${b}..HEAD`])) - Number(git(['rev-list', '--count', `${a}..HEAD`])))[0];
+    let earlierDiff = '';
+    let earlierCommits = [];
+    if (earliest !== from && gitOk(['merge-base', '--is-ancestor', earliest, from])) {
+      const older = L.splitUnifiedDiff(git(['diff', '-M', `${earliest}..${from}`])).filter((p) => !isEditableDoc(p.path) && !isIgnored(p.path));
+      const packedOld = L.packDiff(older, cfg.max_stale_diff_tokens);
+      for (const p of older) if (packedOld.included.includes(p.path)) earlierByPath.set(p.path, p);
+      earlierDiff = packedOld.diff;
+      earlierCommits = L.parseGitLog(git(['log', '--reverse', '--no-merges', `--format=${L.GIT_LOG_FORMAT}`, `${earliest}..${from}`]))
+        .filter((c) => !L.isBotEmail(c.email))
+        .slice(-50)
+        .map((c) => ({ short: c.short, subject: c.subject }));
+    }
+    staleText = L.renderStaleBlock({ docs: staleCarried, from: earliest, to: from, commits: earlierCommits, diff: earlierDiff });
+    log(`Stale edit(s) sent back to triage: ${staleCarried.join(', ')}` + (earlierDiff ? ` (earlier changes ${earliest.slice(0, 7)}..${from.slice(0, 7)}, ${earlierByPath.size} file(s))` : ''));
+  }
 
   // 5.6 manifest
   const docPaths = [...new Set([...walkDocs(isEditableDoc), ...carried.keys()])];
@@ -308,7 +337,7 @@ async function main() {
   };
 
   // 5.7 triage
-  const prefix = L.writerPrefix({ guidelines: guidelines.text, narrative, diff: packed.diff, manifest: manifestText });
+  const prefix = L.writerPrefix({ guidelines: guidelines.text, narrative, diff: packed.diff, manifest: manifestText, stale: staleText });
   const triageRaw = await callModel(models.triage, 'triage', { system: L.TRIAGE_SYSTEM, blocks: [{ text: prefix }], maxTokens: cfg.response_max_tokens });
   const triage = L.parseTriage(triageRaw.text, { isEditableDocPath, exists: (p) => readCurrent(p) != null, maxDocs: cfg.max_docs_per_run });
   if (!triage) throw new Error('triage returned unparseable output (run with DEBUG=1 to see it)');
@@ -322,7 +351,7 @@ async function main() {
     log(`TRIAGE_ONLY set; stopping. ${costLine(usage)}`);
     return;
   }
-  if (!triage.affected.length) {
+  if (!triage.affected.length && !mustRefresh) {
     log(costLine(usage));
     moveCursor('No docs affected; nothing to write');
     return;
@@ -344,7 +373,7 @@ async function main() {
       path: a.path,
       action: a.action,
       reason: a.reason,
-      sourcePatches: a.source_files.map((f) => patchByPath.get(f)?.patch).filter(Boolean).join('\n\n'),
+      sourcePatches: a.source_files.flatMap((f) => [earlierByPath.get(f)?.patch, patchByPath.get(f)?.patch]).filter(Boolean).join('\n\n'),
       current: readCurrent(a.path) ?? '',
     });
   const writeDoc = async (a, extra = '') => {
@@ -377,6 +406,7 @@ async function main() {
             text: L.checkerUser({
               narrative,
               diff: packed.diff,
+              stale: staleText,
               docs: drafts.map((d) => ({ ...d, editDiff: L.unifiedDiff(d.current ?? '', d.content, d.path) })),
             }),
           },
@@ -437,15 +467,15 @@ async function main() {
   }
   for (const d of dropped) log(`DROP ${d.path} -- gate ${d.gate}: ${d.reason}`);
   for (const h of heldBack) log(`HELD ${h.path} -- ${h.reason}`);
-  const prevRuns = L.parseMarker(openPr?.body);
-  for (const s of staleCarried) log(`STALE carried edit dropped, target changed ${s}; re-run with since=${L.regenerateFrom(prevRuns, s, carryBase)} to regenerate`);
+  for (const s of staleCarried)
+    log(`STALE carried edit discarded, target changed ${s}; ` + (kept.some((k) => k.path === s) ? 'redone this run' : `not reselected (force with since=${L.regenerateFrom(prevRuns, s, carryBase)})`));
   for (const a of triage.overflow) log(`ALSO likely affected, not edited this run: ${a.path}`);
   for (const d of triage.deleteCandidates) log(`DELETE candidate (never acted on): ${d.path} -- ${d.reason}`);
   if (carried.size) log(`CARRIED forward from earlier runs: ${[...carried.keys()].join(', ')}`);
   if (packed.omitted.length) log(`DIFF over budget, not shown to the models: ${packed.omitted.join(', ')}`);
   log(costLine(usage));
 
-  if (!kept.length) {
+  if (!kept.length && !mustRefresh) {
     moveCursor('Nothing survived the gates; the rolling PR is left as it is');
     return;
   }
@@ -465,7 +495,7 @@ async function main() {
     runUrl: RUN_URL,
     kept,
     carried: carriedOnly.map((p) => ({ path: p, run: L.lastRunFor(prevRuns, p) })),
-    stale: staleCarried.map((p) => ({ path: p, since: L.regenerateFrom(prevRuns, p, carryBase) })),
+    stale: staleCarried.map((p) => ({ path: p, since: L.regenerateFrom(prevRuns, p, carryBase), redone: keptPaths.has(p) })),
     dropped,
     heldBack,
     deleteCandidates: triage.deleteCandidates,
@@ -502,7 +532,8 @@ async function main() {
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
-  if (tree === git(['rev-parse', `${head}^{tree}`])) {
+  // With an open PR the push still happens, so the PR stops showing edits that were dropped.
+  if (tree === git(['rev-parse', `${head}^{tree}`]) && !openPr) {
     moveCursor('The edits reproduce the target tree exactly; nothing to publish');
     return;
   }

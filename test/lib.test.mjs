@@ -74,6 +74,11 @@ import {
   renderMarker,
   lastRunFor,
   regenerateFrom,
+  renderStaleBlock,
+  triageUser,
+  writerPrefix,
+  checkerUser,
+  TRIAGE_SYSTEM,
   renderPrBody,
   PR_BODY_MAX,
 } from '../lib.mjs';
@@ -940,7 +945,10 @@ describe('PR body', () => {
       },
     ],
     carried: [{ path: 'README.md', run: { from: '1111111aaa', to: '2222222bbb' } }],
-    stale: [{ path: 'docs/old.md', since: 'c'.repeat(40) }],
+    stale: [
+      { path: 'docs/old.md', since: 'c'.repeat(40), redone: false },
+      { path: 'docs/api.md', since: 'd'.repeat(40), redone: true },
+    ],
     dropped: [{ path: 'docs/bad.md', gate: 2, reason: 'broken relative link(s): ./@nope.md' }],
     heldBack: [{ path: 'docs/huge.md', reason: 'too large for a full rewrite in v1' }],
     deleteCandidates: [{ path: 'docs/gone.md', reason: 'App removed' }],
@@ -955,14 +963,17 @@ describe('PR body', () => {
     const body = renderPrBody(base());
     assert.ok(body.startsWith('> [!WARNING]\n> **Guideline file edited: `AGENTS.md`.**'), 'banner at the very top');
     assert.match(body, /````diff\n[\s\S]*\+new ``` closes #​3\n````/, 'fence outlasts the backticks in the diff, keyword defused');
-    for (const h of ['Edited this run', 'Carried forward', 'Stale unmerged edits dropped', 'Held back', 'Reviewer attention', 'Delete candidates', 'Also likely affected', 'Diff not shown', 'Change narrative', 'API usage'])
-      assert.ok(body.includes(`### ${h}`), h);
+    for (const h of ['Edited this run', 'Carried forward', 'Earlier edits discarded because `develop` changed the file', 'Held back', 'New links, raw HTML and vendor names to check', 'Delete candidates', 'Also likely affected', 'Diff not shown', 'Commits and PRs in this range', 'API usage'])
+      assert.ok(body.includes(`\n#### ${h}`), h);
+    assert.ok(!/^#{1,3} /m.test(body), 'no heading above level 4');
+    assert.ok(!body.includes('Nothing merges without a human'));
     assert.match(body, /thanks @​alice, fixes #​12 &lt;!--/);
     assert.match(body, /addressed in the correction pass:\n    - \[must\] Claims hCaptcha &lt;b&gt;still&lt;\/b&gt; runs/);
     assert.match(body, /Checker: \*\*unchecked\*\*/);
     assert.match(body, /2 line\(s\) had en\/em dashes replaced/);
     assert.match(body, /`README\.md` \(from `1111111\.\.2222222`\)/);
-    assert.match(body, /`docs\/old\.md`: `develop` changed this file since the edit was made\. Re-run with `since=c{40}`/);
+    assert.match(body, /`docs\/old\.md`: triage was asked again and did not select it\. To force it, re-run with `since=c{40}`/);
+    assert.match(body, /`docs\/api\.md`: redone this run on top of the new version/);
     assert.match(body, /gate 2: broken relative link\(s\): \.\/@​nope\.md/);
     assert.match(body, /new URLs: `https:\/\/evil\.example\/@​x`/);
     assert.match(body, /- #153 refactor: move funnel, closes #​99\n  - `abc1234` refactor @​bob/);
@@ -977,7 +988,7 @@ describe('PR body', () => {
     const body = renderPrBody({ ...base(), outline });
     assert.ok(body.length <= PR_BODY_MAX, `${body.length}`);
     assert.match(body, /more line\(s\) not shown/);
-    assert.match(body, /### API usage/, 'sections after the narrative are kept');
+    assert.match(body, /#### API usage/, 'sections after the narrative are kept');
     assert.deepEqual(parseMarker(body), base().runs);
 
     const huge = base();
@@ -994,5 +1005,36 @@ describe('PR body', () => {
     const u = makeUsageLog();
     u.log('triage', 'claude-sonnet-5', { input: 1e6, cacheRead: 0, cacheWrite: 0, output: 0 });
     assert.equal(u.entries[0].cost, 2);
+  });
+});
+
+describe('stale edits go back to triage', () => {
+  const stale = () =>
+    renderStaleBlock({
+      docs: ['docs/api.md'],
+      from: 'a'.repeat(40),
+      to: 'b'.repeat(40),
+      commits: [{ short: 'c0ffee1', subject: 'feat(server): read PORT' }],
+      diff: '--- FILE: src/server.js (M) ---\n+const PORT = 8080;',
+    });
+
+  test('the block names the docs, the earlier range, its commits and its diff', () => {
+    const text = stale();
+    assert.match(text, /^<stale_edits>\n.*discarded: docs\/api\.md\n/);
+    assert.match(text, /\(aaaaaaa\.\.bbbbbbb, already on the target branch before this range\)/);
+    assert.match(text, /Commits:\n- c0ffee1 feat\(server\): read PORT/);
+    assert.match(text, /<earlier_diff>\n--- FILE: src\/server\.js \(M\) ---\n\+const PORT = 8080;\n<\/earlier_diff>\n<\/stale_edits>$/);
+    assert.match(renderStaleBlock({ docs: ['docs/api.md'] }), /inside <diff>/, 'no earlier diff when the range already covers it');
+    assert.equal(renderStaleBlock({ docs: [] }), '');
+  });
+
+  test('triage, writer prefix and checker all carry it; nothing changes without it', () => {
+    const base = { guidelines: 'g', narrative: 'n', diff: 'd', manifest: 'm' };
+    assert.equal(triageUser(base), triageUser({ ...base, stale: '' }));
+    assert.ok(!triageUser(base).includes('stale_edits'));
+    assert.ok(triageUser({ ...base, stale: stale() }).endsWith(stale()), 'last, so the prefix up to the manifest is unchanged');
+    assert.equal(writerPrefix({ ...base, stale: stale() }), triageUser({ ...base, stale: stale() }));
+    assert.match(checkerUser({ narrative: 'n', diff: 'd', docs: [], stale: stale() }), /<earlier_diff>/);
+    assert.match(TRIAGE_SYSTEM, /<stale_edits> block is present, re-evaluate every doc it lists/);
   });
 });
