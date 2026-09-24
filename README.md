@@ -102,12 +102,11 @@ that is empty.
 
 | Secret | Required |
 | --- | --- |
-| `ANTHROPIC_API_KEY` | At least one of the two |
-| `OPENAI_API_KEY` | At least one of the two |
+| `ANTHROPIC_API_KEY` | Yes. The writer calls Claude Opus 5.5 |
+| `OPENAI_API_KEY` | Yes. Triage calls GPT-6 Luna; the checker calls GPT-6 Sol |
 | `DOCS_SYNC_TOKEN` | No. Escape hatch, see below |
 
-With both keys set, the checker runs on a different provider from the writer. With one, both
-passes use that provider.
+Triage runs at low effort. The writer and the checker run at medium.
 
 `GITHUB_TOKEN` is supplied by Actions and is enough for the default path, with **one repo
 setting**: a repo admin enables "Allow GitHub Actions to create and approve pull requests"
@@ -233,8 +232,9 @@ Edit `DEFAULTS` in `lib.mjs`, then check **two** other places in the same file:
 
 1. **`PRICES`**: add the new model, or the cost line reports it as unpriced and excludes it from
    the total.
-2. **`EFFORT_MODELS`**: a model-family regex gating `output_config.effort`. A model string that
-   does not match silently loses the effort config rather than erroring.
+2. **`EFFORT_MODELS`**: a model-family regex gating Anthropic `output_config.effort`. A Claude
+   model string that does not match silently loses the effort config rather than erroring.
+   OpenAI calls send `reasoning.effort` whenever the stage has an effort set.
 
 Then release it (below). Every consumer picks it up on its next run.
 
@@ -270,7 +270,7 @@ git fetch origin && git checkout --detach origin/develop
 
 ```bash
 GITHUB_TOKEN=$(gh auth token) REPO=owner/name TARGET_BRANCH=develop SINCE=<sha> \
-  ANTHROPIC_API_KEY=sk-ant-junk TRIAGE_ONLY=1 node /path/to/ai-docs-sync/docs-sync.mjs
+  ANTHROPIC_API_KEY=sk-ant-junk OPENAI_API_KEY=sk-junk TRIAGE_ONLY=1 node /path/to/ai-docs-sync/docs-sync.mjs
 ```
 
 > **Only `TRIAGE_ONLY=1` writes nothing.** Every other run writes to the real repo as soon as
@@ -282,7 +282,7 @@ GITHUB_TOKEN=$(gh auth token) REPO=owner/name TARGET_BRANCH=develop SINCE=<sha> 
 | Env | Effect |
 | --- | --- |
 | `SINCE` | Start of the diff range; must be an ancestor of the target head. Skips the cursor read. |
-| `TRIAGE_ONLY=1` | Stops after triage and never writes. With a junk API key everything free runs (range, changed files, narrative, packed diff, carry-forward, manifest, guidelines) and the run dies at a 401 having spent nothing. |
+| `TRIAGE_ONLY=1` | Stops after triage and never writes. With junk API keys everything free runs (range, changed files, narrative, packed diff, carry-forward, manifest, guidelines) and the run dies at a 401 having spent nothing. |
 | `DRY_RUN=1` | Runs the model calls and gates (paid), prints the branch, the diffs, the PR title and body, and moves the cursor. Pushes no branch, touches no PR. |
 | `DEBUG=1` | Logs every model's raw output and stack traces to stderr. |
 | `PUSH_BEFORE`, `PUSH_FORCED` | What the workflow passes from the push event; used only when there is no cursor ref. |

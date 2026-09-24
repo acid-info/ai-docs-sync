@@ -30,12 +30,9 @@ export const API = {
 // Models, effort and budgets are owned here. Change a model in DEFAULTS, then update PRICES and
 // check EFFORT_MODELS still matches it: all three or the cost line and effort silently drift.
 export const DEFAULTS = {
-  anthropic_triage_model: 'claude-sonnet-5',
-  anthropic_writer_model: 'claude-opus-5',
-  anthropic_checker_model: 'claude-sonnet-5',
-  openai_triage_model: 'gpt-5.6-terra',
-  openai_writer_model: 'gpt-5.6-terra',
-  openai_checker_model: 'gpt-5.4-2026-03-05',
+  triage_model: 'gpt-6-luna',
+  writer_model: 'claude-opus-5-5',
+  checker_model: 'gpt-6-sol',
   triage_effort: 'low',
   writer_effort: 'medium',
   checker_effort: 'medium',
@@ -91,18 +88,22 @@ export const BUILT_IN_IGNORE = [
 // tool inside the consumer's tree.
 export const DENYLIST = ['.github/**', '.git/**', '**/node_modules/**', '.ai-docs-sync/**'];
 
-// $/MTok. Cache reads are billed at a tenth of input, cache writes at 1.25x.
+// $/MTok. Cache reads default to a tenth of input; `cacheRead` overrides that fraction.
+// Cache writes are 1.25x input. Opus 5.5 reads are 5% ($0.20); its 5-minute writes stay at 1.25x.
 export const PRICES = {
+  'claude-opus-5-5': { in: 4, out: 20, cacheRead: 0.05 },
   'claude-opus-5': { in: 5, out: 25 },
   'claude-opus-4-8': { in: 5, out: 25 },
   'claude-sonnet-5': { in: 2, out: 10 },
   'claude-haiku-4-5': { in: 1, out: 5 },
+  'gpt-6-luna': { in: 0.1, out: 0.5 },
+  'gpt-6-sol': { in: 2, out: 10 },
   'gpt-5.6-terra': { in: 2.5, out: 15 },
   'gpt-5.4-2026-03-05': { in: 2.5, out: 15 },
 };
 
 // `output_config.effort` is rejected by Haiku 4.5, Sonnet 4.5 and older.
-export const EFFORT_MODELS = /^claude-(fable-5|mythos-5|opus-(5|4-[5-8])|sonnet-(5|4-6))\b/;
+export const EFFORT_MODELS = /^claude-(fable-5|mythos-5|opus-(5-5|5|4-[5-8])|sonnet-(5|4-6))\b/;
 
 export const BOT_NAME = 'github-actions[bot]';
 export const BOT_EMAIL = '41898282+github-actions[bot]@users.noreply.github.com';
@@ -969,25 +970,14 @@ export function decideAfterCheck(verdictEntry) {
 // ---------------------------------------------------------------- providers ---
 
 export function pickModels({ anthropic, openai }, d = DEFAULTS) {
-  if (!anthropic && !openai) throw new Error('Missing required env var(s): ANTHROPIC_API_KEY or OPENAI_API_KEY');
-  if (anthropic && openai) {
-    return {
-      triage: { provider: 'anthropic', model: d.anthropic_triage_model, effort: d.triage_effort },
-      writer: { provider: 'anthropic', model: d.anthropic_writer_model, effort: d.writer_effort },
-      checker: { provider: 'openai', model: d.openai_checker_model, effort: d.checker_effort },
-    };
-  }
-  if (anthropic) {
-    return {
-      triage: { provider: 'anthropic', model: d.anthropic_triage_model, effort: d.triage_effort },
-      writer: { provider: 'anthropic', model: d.anthropic_writer_model, effort: d.writer_effort },
-      checker: { provider: 'anthropic', model: d.anthropic_checker_model, effort: d.checker_effort },
-    };
-  }
+  const missing = [];
+  if (!anthropic) missing.push('ANTHROPIC_API_KEY');
+  if (!openai) missing.push('OPENAI_API_KEY');
+  if (missing.length) throw new Error(`Missing required env var(s): ${missing.join(', ')}`);
   return {
-    triage: { provider: 'openai', model: d.openai_triage_model, effort: d.triage_effort },
-    writer: { provider: 'openai', model: d.openai_writer_model, effort: d.writer_effort },
-    checker: { provider: 'openai', model: d.openai_checker_model, effort: d.checker_effort },
+    triage: { provider: 'openai', model: d.triage_model, effort: d.triage_effort },
+    writer: { provider: 'anthropic', model: d.writer_model, effort: d.writer_effort },
+    checker: { provider: 'openai', model: d.checker_model, effort: d.checker_effort },
   };
 }
 
@@ -1099,7 +1089,7 @@ export async function anthropicCall({ fetch: f, apiKey, model, system, blocks, m
   return { text, usage, stopReason };
 }
 
-export async function openaiCall({ fetch: f, apiKey, model, system, blocks, maxTokens, timeoutMs = 600_000, retry = {} }) {
+export async function openaiCall({ fetch: f, apiKey, model, system, blocks, maxTokens, effort, timeoutMs = 600_000, retry = {} }) {
   const res = await fetchRetry(
     f,
     `${API.openai.baseUrl}${API.openai.responsesPath}`,
@@ -1109,6 +1099,7 @@ export async function openaiCall({ fetch: f, apiKey, model, system, blocks, maxT
       body: JSON.stringify({
         model,
         max_output_tokens: maxTokens,
+        ...(effort ? { reasoning: { effort } } : {}),
         input: [
           { role: 'system', content: system },
           { role: 'user', content: blocks.map((b) => b.text).join('\n\n') },
@@ -1139,7 +1130,8 @@ export async function openaiCall({ fetch: f, apiKey, model, system, blocks, maxT
 export function costOf(model, usage) {
   const p = PRICES[model];
   if (!p) return null;
-  return (usage.input * p.in + usage.cacheRead * p.in * 0.1 + usage.cacheWrite * p.in * 1.25 + usage.output * p.out) / 1e6;
+  const cacheRead = p.cacheRead ?? 0.1;
+  return (usage.input * p.in + usage.cacheRead * p.in * cacheRead + usage.cacheWrite * p.in * 1.25 + usage.output * p.out) / 1e6;
 }
 
 export function makeUsageLog(log = () => {}, warn = () => {}) {

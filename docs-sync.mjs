@@ -2,7 +2,7 @@
 // Entry point: env parsing and stage orchestration. Everything pure lives in lib.mjs; this is the
 // only file that reads process.env, runs git or touches the network.
 //
-// Env: GITHUB_TOKEN, REPO ("owner/name"), TARGET_BRANCH, ANTHROPIC_API_KEY and/or OPENAI_API_KEY.
+// Env: GITHUB_TOKEN, REPO ("owner/name"), TARGET_BRANCH, ANTHROPIC_API_KEY, OPENAI_API_KEY.
 // Optional: PUSH_BEFORE, PUSH_FORCED, SINCE, DRY_RUN, TRIAGE_ONLY, DEBUG, RUN_URL.
 // Runs from the target-branch checkout with full history (fetch-depth: 0).
 
@@ -149,7 +149,8 @@ async function main() {
   ]
     .filter(([, v]) => !v)
     .map(([k]) => k);
-  if (!ANTHROPIC_API_KEY && !OPENAI_API_KEY) missing.push('ANTHROPIC_API_KEY or OPENAI_API_KEY');
+  if (!ANTHROPIC_API_KEY) missing.push('ANTHROPIC_API_KEY');
+  if (!OPENAI_API_KEY) missing.push('OPENAI_API_KEY');
   if (missing.length) throw new Error(`Missing required env var(s): ${missing.join(', ')}`);
 
   const models = L.pickModels({ anthropic: ANTHROPIC_API_KEY, openai: OPENAI_API_KEY });

@@ -506,15 +506,13 @@ describe('checker parser and the single-correction rule', () => {
 });
 
 describe('providers', () => {
-  test('checker runs on the other provider when both keys exist, another model otherwise', () => {
-    const both = pickModels({ anthropic: 'a', openai: 'o' });
-    assert.equal(both.writer.provider, 'anthropic');
-    assert.equal(both.checker.provider, 'openai');
-    const one = pickModels({ anthropic: 'a' });
-    assert.equal(one.checker.provider, 'anthropic');
-    assert.notEqual(one.checker.model, one.writer.model);
-    const oa = pickModels({ openai: 'o' });
-    assert.notEqual(oa.checker.model, oa.writer.model);
+  test('triage and checker are OpenAI, the writer is Anthropic, and both keys are required', () => {
+    const models = pickModels({ anthropic: 'a', openai: 'o' });
+    assert.deepEqual(models.triage, { provider: 'openai', model: 'gpt-6-luna', effort: 'low' });
+    assert.deepEqual(models.writer, { provider: 'anthropic', model: 'claude-opus-5-5', effort: 'medium' });
+    assert.deepEqual(models.checker, { provider: 'openai', model: 'gpt-6-sol', effort: 'medium' });
+    assert.throws(() => pickModels({ anthropic: 'a' }), /OPENAI_API_KEY/);
+    assert.throws(() => pickModels({ openai: 'o' }), /ANTHROPIC_API_KEY/);
     assert.throws(() => pickModels({}), /Missing required env var/);
   });
   test('every model in DEFAULTS is priced and effort-gated correctly', () => {
@@ -523,7 +521,7 @@ describe('providers', () => {
       assert.ok(PRICES[v], `${v} priced`);
       if (v.startsWith('claude-')) assert.ok(EFFORT_MODELS.test(v), `${v} accepts effort`);
     }
-    assert.deepEqual(effortConfig('claude-opus-5', 'low'), { output_config: { effort: 'low' } });
+    assert.deepEqual(effortConfig('claude-opus-5-5', 'medium'), { output_config: { effort: 'medium' } });
     assert.deepEqual(effortConfig('claude-haiku-4-5', 'low'), {});
   });
 });
@@ -588,22 +586,23 @@ describe('model calls over fetch', () => {
       sent = JSON.parse(init.body);
       return { ok: true, status: 200, json: async () => ({ output: [{ content: [{ type: 'output_text', text: '{"files":[]}' }] }], usage: { input_tokens: 50, output_tokens: 5, input_tokens_details: { cached_tokens: 20 } }, status: 'completed' }) };
     };
-    const r = await openaiCall({ fetch, apiKey: 'k', model: 'gpt-5.6-terra', system: 'S', blocks: [{ text: 'a' }, { text: 'b' }], maxTokens: 100 });
+    const r = await openaiCall({ fetch, apiKey: 'k', model: 'gpt-6-luna', system: 'S', blocks: [{ text: 'a' }, { text: 'b' }], maxTokens: 100, effort: 'low' });
     assert.equal(r.text, '{"files":[]}');
     assert.deepEqual(r.usage, { input: 30, cacheRead: 20, cacheWrite: 0, output: 5 });
     assert.equal(sent.input[1].content, 'a\n\nb');
+    assert.deepEqual(sent.reasoning, { effort: 'low' });
   });
 
-  test('usage log prices cache reads at a tenth and reports unpriced models', () => {
+  test('usage log prices Opus 5.5 cache reads at 5% and reports unpriced models', () => {
     const lines = [];
     const warns = [];
     const u = makeUsageLog((l) => lines.push(l), (w) => warns.push(w));
-    u.log('writer', 'claude-opus-5', { input: 1_000_000, cacheRead: 1_000_000, cacheWrite: 0, output: 100_000 });
-    assert.equal(u.total().toFixed(2), (5 + 0.5 + 2.5).toFixed(2));
+    u.log('writer', 'claude-opus-5-5', { input: 1_000_000, cacheRead: 1_000_000, cacheWrite: 0, output: 100_000 });
+    assert.equal(u.total().toFixed(2), (4 + 0.2 + 2).toFixed(2));
     u.log('x', 'mystery', { input: 1, cacheRead: 0, cacheWrite: 0, output: 1 });
     assert.equal(warns.length, 1);
     assert.deepEqual(u.unpriced(), ['mystery']);
-    assert.match(lines[0], /\[cost\] writer \(claude-opus-5\)/);
+    assert.match(lines[0], /\[cost\] writer \(claude-opus-5-5\)/);
   });
 
   test('mapConcurrent bounds parallelism and keeps order', async () => {
