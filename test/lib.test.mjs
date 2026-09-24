@@ -1016,6 +1016,7 @@ describe('stale edits go back to triage', () => {
       to: 'b'.repeat(40),
       commits: [{ short: 'c0ffee1', subject: 'feat(server): read PORT' }],
       diff: '--- FILE: src/server.js (M) ---\n+const PORT = 8080;',
+      current: { 'docs/api.md': '# HTTP API\n\nListens on 3000.\n' },
     });
 
   test('the block names the docs, the earlier range, its commits and its diff', () => {
@@ -1023,7 +1024,9 @@ describe('stale edits go back to triage', () => {
     assert.match(text, /^<stale_edits>\n.*discarded: docs\/api\.md\n/);
     assert.match(text, /\(aaaaaaa\.\.bbbbbbb, already on the target branch before this range\)/);
     assert.match(text, /Commits:\n- c0ffee1 feat\(server\): read PORT/);
-    assert.match(text, /<earlier_diff>\n--- FILE: src\/server\.js \(M\) ---\n\+const PORT = 8080;\n<\/earlier_diff>\n<\/stale_edits>$/);
+    assert.match(text, /<earlier_diff>\n--- FILE: src\/server\.js \(M\) ---\n\+const PORT = 8080;\n<\/earlier_diff>\n/);
+    assert.match(text, /<stale_doc path="docs\/api\.md">\n# HTTP API\n\nListens on 3000\.\n<\/stale_doc>\n<\/stale_edits>$/, 'triage sees the current text');
+    assert.match(renderStaleBlock({ docs: ['docs/big.md'], current: { 'docs/big.md': null } }), /<stale_doc path="docs\/big\.md">\(too large to include\)<\/stale_doc>/);
     assert.match(renderStaleBlock({ docs: ['docs/api.md'] }), /inside <diff>/, 'no earlier diff when the range already covers it');
     assert.equal(renderStaleBlock({ docs: [] }), '');
   });

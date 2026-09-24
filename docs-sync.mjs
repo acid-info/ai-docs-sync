@@ -311,7 +311,13 @@ async function main() {
         .slice(-50)
         .map((c) => ({ short: c.short, subject: c.subject }));
     }
-    staleText = L.renderStaleBlock({ docs: staleCarried, from: earliest, to: from, commits: earlierCommits, diff: earlierDiff });
+    const current = Object.fromEntries(
+      staleCarried.map((p) => {
+        const text = readCurrent(p);
+        return [p, text != null && L.approxTokens(text) <= cfg.max_doc_tokens ? text : null];
+      })
+    );
+    staleText = L.renderStaleBlock({ docs: staleCarried, from: earliest, to: from, commits: earlierCommits, diff: earlierDiff, current });
     log(`Stale edit(s) sent back to triage: ${staleCarried.join(', ')}` + (earlierDiff ? ` (earlier changes ${earliest.slice(0, 7)}..${from.slice(0, 7)}, ${earlierByPath.size} file(s))` : ''));
   }
 
