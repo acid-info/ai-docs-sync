@@ -29,14 +29,17 @@ swapping a model is one edit here, not one per consumer.
    before any API call.
 6. Triage picks the affected docs. A writer model rewrites each one, a checker model reviews
    the rewrite and can demand at most one correction pass.
-7. Mechanical gates run on every edit: the path allowlist, link resolution, dash and attribution
-   scans, size sanity, a banner for guideline-file edits, optional prettier.
+7. Mechanical gates run on every edit: the path allowlist, resolution of added links, dash and
+   attribution scans, size sanity, a banner for guideline-file edits, optional prettier.
 8. The result is pushed to one rolling branch and one rolling PR per repo, updated in place.
    Edits not yet merged survive the next run. The cursor advances whatever the outcome.
 
 Retries: every GitHub and model call has a timeout and is retried once, with backoff, on a
 5xx, a 429 or Anthropic's 529. A second failure fails the run, and the cursor stays put so the
-next push picks the range up again.
+next push picks the range up again. The exceptions are the checker, whose failure leaves the
+edits unchecked, and the writer: a failed call holds back only that doc, unless no writer call
+succeeded and at least one failure was an outage (a 5xx, 429, 529 or network error) rather than
+something about the request (a 400, a timeout).
 
 The tool has **zero npm dependencies** and runs on Node 22's global `fetch`. Keep it that way:
 no build step, no `package.json`.
@@ -130,7 +133,7 @@ key.
 
 | Key | Effect |
 | --- | --- |
-| `doc_paths` | Globs the tool may create or edit. Markdown only; anything else is refused in code. |
+| `doc_paths` | Globs the tool may create or edit. Markdown only; anything else is refused in code. A list may be written as `- item` lines or inline as `[a, b]`. |
 | `never_touch` | Subtracted from `doc_paths`. Everything under `.github/` is subtracted whether or not it is listed. |
 | `extra_ignore` | Diff-side ignores, appended to the built-in list. Same semantics as ai-review. |
 | `guidelines_files` | Priority list; the first that exists is loaded. `AGENTS.md` is special-cased as in ai-review. |
@@ -187,8 +190,11 @@ with the full diff inline. A repo that wants them hand-maintained lists them in 
   target's new version. Either way the PR is updated, so it never keeps a conflicting edit. After
   the PR is merged or closed nothing is carried: merged edits are already in the target, and
   closing means "not now". The next publishing run opens a fresh PR on the same branch.
-- **Ownership.** If the branch holds a commit the tool did not make, the run refuses before any
-  paid call. Rename or delete that branch.
+- **Ownership.** The branch may hold, besides the tool's commits, merges (the PR's "Update
+  branch" button) and other people's commits that only add or edit editable docs (a reviewer's
+  suggestion); those edits are carried forward like the tool's own. Any other commit (code, a
+  deleted or renamed doc), or a branch the tool never committed to, makes the run refuse before
+  any paid call. Rename or delete that branch.
 - The PR body lists, per file: the triage reason, the checker's verdict and issues, and whether
   a correction pass addressed them. It also lists carried edits, discarded edits and whether
   they were redone, held-back files and the gate that stopped them, new links and raw HTML,
@@ -226,7 +232,7 @@ git push -f origin <sha>:refs/ai-docs-sync/cursor
 
 To re-process a range without touching the cursor first, dispatch the workflow with
 `since=<sha>`. `since` must be an ancestor of the target head. Ranges are capped at the newest
-250 commits, so backfill a long history in slices.
+250 commits on the target's first-parent line, so backfill a long history in slices.
 
 ## Changing a model
 
@@ -312,10 +318,14 @@ dispatched directly. End-to-end changes have to be proved on a real push in a co
 - The cursor is a git ref, movable only with `contents: write`. Nothing read from a PR body
   drives control flow; the rolling PR is located by head and base, not by marker.
 - The force-push target is validated (not the target or default branch, safe charset) and the
-  existing branch must consist solely of the tool's own commits.
-- No write credential is persisted in the checkout. `setup_command` and prettier run in a tree
-  whose `.git/config` holds no token; only the push and cursor-update child processes receive
-  it, via environment.
+  existing branch must hold nothing but the tool's commits, merges and doc additions or edits.
+- No write credential is persisted in the checkout. The token and API keys are removed from the
+  tool's environment at startup, so they are not passed to `setup_command`, prettier or git.
+  Only the push and cursor-update child processes receive the token, via environment, and they
+  run from a throwaway git dir that borrows the checkout's objects, so no hook or config written
+  into `.git` runs next to the token. This does not sandbox `setup_command`: on a hosted runner
+  its code runs as the same user as the tool, with passwordless sudo. A repo that does not trust
+  its install scripts keeps `format_check: off`.
 - `permissions:` is bounded by the consumer's workflow file. Never `secrets: inherit`.
 - Nothing from the event payload is interpolated into shell text; the resolve step reads it from
   `env`.

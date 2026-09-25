@@ -1,15 +1,10 @@
 #!/usr/bin/env node
-// Entry point: env parsing and stage orchestration. Everything pure lives in lib.mjs; this is the
-// only file that reads process.env, runs git or touches the network.
-//
-// Env: GITHUB_TOKEN, REPO ("owner/name"), TARGET_BRANCH, ANTHROPIC_API_KEY, OPENAI_API_KEY.
-// Optional: PUSH_BEFORE, PUSH_FORCED, SINCE, DRY_RUN, TRIAGE_ONLY, DEBUG, RUN_URL.
-// Runs from the target-branch checkout with full history (fetch-depth: 0).
+// The only file that reads process.env, runs git or touches the network; the rest is in lib.mjs.
 
 import { execFileSync, execSync } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync, lstatSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, lstatSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import * as L from './lib.mjs';
 
 const {
@@ -23,6 +18,8 @@ const {
   SINCE,
   RUN_URL,
 } = process.env;
+// Children (setup_command, prettier, git) inherit process.env; only the push gets a token back.
+for (const k of ['GITHUB_TOKEN', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY']) delete process.env[k];
 const truthy = (v) => /^(1|true|yes)$/i.test(v ?? '');
 const DRY_RUN = truthy(process.env.DRY_RUN);
 const TRIAGE_ONLY = truthy(process.env.TRIAGE_ONLY);
@@ -39,7 +36,8 @@ const debug = (label, text) => {
 
 // `raw` keeps the trailing newline: file contents must round-trip byte for byte.
 function git(args, { quiet = false, input, env, raw = false } = {}) {
-  const out = execFileSync('git', args, {
+  // Unquoted paths, so non-ASCII names match the -z output they are compared with.
+  const out = execFileSync('git', ['-c', 'core.quotePath=false', ...args], {
     cwd: ROOT,
     encoding: 'utf8',
     maxBuffer: 512 * 1024 * 1024,
@@ -82,9 +80,22 @@ async function gh(path, { allow404 = false, method = 'GET', body } = {}) {
   return res.status === 204 ? null : res.json();
 }
 
-// The only two callers are the rolling-branch push and the cursor move.
+// Pushes from a throwaway repo that borrows the checkout's objects: setup_command can write hooks
+// and config into .git, and none of it may run next to the token.
 function pushWithToken(args) {
-  git(['push', '--quiet', ...args], { env: L.gitAuthEnv(GITHUB_TOKEN) });
+  const objects = resolve(ROOT, git(['rev-parse', '--git-path', 'objects']));
+  const dir = mkdtempSync(join(tmpdir(), 'ai-docs-sync-push-'));
+  try {
+    mkdirSync(join(dir, 'objects', 'info'), { recursive: true });
+    mkdirSync(join(dir, 'refs'));
+    writeFileSync(join(dir, 'objects', 'info', 'alternates'), `${objects}\n`);
+    writeFileSync(join(dir, 'HEAD'), 'ref: refs/heads/main\n');
+    writeFileSync(join(dir, 'config'), '[core]\n\trepositoryformatversion = 0\n\tbare = true\n');
+    const env = { GIT_DIR: dir, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', ...L.gitAuthEnv(GITHUB_TOKEN) };
+    git(['push', '--quiet', ...args], { env });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 // `git ls-tree` entry for one path: { mode, blob } or null.
@@ -123,7 +134,7 @@ function walkDocs(isEditableDoc, dir = '') {
 function makeFormatter(cfg) {
   if (cfg.format_check !== 'strict') return { mode: 'off' };
   log(`Running setup_command for format_check: strict`);
-  execSync(cfg.setup_command, { cwd: ROOT, stdio: 'inherit', env: { ...process.env, GITHUB_TOKEN: '', ANTHROPIC_API_KEY: '', OPENAI_API_KEY: '' } });
+  execSync(cfg.setup_command, { cwd: ROOT, stdio: 'inherit' });
   const prettier = join(ROOT, 'node_modules', '.bin', 'prettier');
   if (!existsSync(prettier)) throw new Error('format_check: strict but node_modules/.bin/prettier is missing after setup_command');
   return {
@@ -199,14 +210,19 @@ async function main() {
   }
   let from = git(['rev-parse', range.from]);
   let capped = false;
-  const count = Number(git(['rev-list', '--count', `${from}..HEAD`]));
+  let count = Number(git(['rev-list', '--count', `${from}..HEAD`]));
   if (count > cfg.max_commits) {
-    const shas = git(['rev-list', `--max-count=${cfg.max_commits + 1}`, 'HEAD']).split('\n');
-    from = shas[shas.length - 1];
-    capped = true;
-    log(`Range has ${count} commits; capped at the newest ${cfg.max_commits} (from ${from.slice(0, 7)}). Backfill in slices with since=.`);
+    // First-parent, so the new start is on the target's own line and never before the old one.
+    const line = git(['rev-list', '--first-parent', `--max-count=${cfg.max_commits + 1}`, `${from}..HEAD`]).split('\n');
+    if (line.length > cfg.max_commits) {
+      from = line[line.length - 1];
+      capped = true;
+      const all = count;
+      count = Number(git(['rev-list', '--count', `${from}..HEAD`]));
+      log(`Range has ${all} commits; capped at the newest ${cfg.max_commits} first-parent commits (from ${from.slice(0, 7)}). Backfill in slices with since=.`);
+    }
   }
-  log(`Range ${from.slice(0, 7)}..${head.slice(0, 7)} (${range.source}, ${Math.min(count, cfg.max_commits)} commits)`);
+  log(`Range ${from.slice(0, 7)}..${head.slice(0, 7)} (${range.source}, ${count} commits)`);
   if (from === head) {
     moveCursor('Empty range; nothing to do');
     return;
@@ -252,9 +268,8 @@ async function main() {
   const packed = L.packDiff(patches, cfg.max_diff_tokens);
   log(`Packed diff: ${packed.included.length} files, ~${L.approxTokens(packed.diff)} tokens` + (packed.omitted.length ? `, ${packed.omitted.length} over budget` : ''));
 
-  // 5.12 step 1, read side: carried-forward edits from the rolling branch overlay the checkout.
-  // Edits are carried only while a PR for them is open: after a merge they are in the target, and
-  // after a close a human has said "not now".
+  // 5.12 step 1: rolling-branch edits overlay the checkout only while their PR is open; merged
+  // means they are in the target, closed means "not now".
   const owner = REPO.split('/')[0];
   const findOpenPr = async () =>
     (await gh(`/repos/${REPO}/pulls?state=open&head=${encodeURIComponent(`${owner}:${cfg.branch}`)}&base=${encodeURIComponent(TARGET_BRANCH)}`))[0] ?? null;
@@ -268,12 +283,19 @@ async function main() {
   if (remoteSha) {
     const base = git(['merge-base', 'HEAD', remote]);
     const branchCommits = L.parseGitLog(git(['log', `--format=${L.GIT_LOG_FORMAT}`, `${base}..${remote}`]));
-    if (!L.allOwnCommits(branchCommits))
-      throw new Error(`origin/${cfg.branch} has commits not authored by the tool; refusing to build on it. Rename or delete that branch.`);
+    const foreign = L.foreignBranchCommit(branchCommits, {
+      changesOf: (sha) => L.parseNameStatus(git(['diff-tree', '--no-commit-id', '--name-status', '-r', '-z', '-M', sha])),
+      isEditableDoc,
+    });
+    if (foreign)
+      throw new Error(
+        `origin/${cfg.branch} has ${foreign.short} "${foreign.subject}" (${foreign.email}), which is neither the tool's nor a doc addition or edit; ` +
+          `refusing to build on it. Rename or delete that branch.`
+      );
     if (openPr) {
       carryBase = base;
       const plan = L.planCarryForward({
-        branchFiles: git(['diff', '--name-only', base, remote]).split('\n').filter(Boolean),
+        branchFiles: git(['diff', '--name-only', '-z', base, remote]).split('\0').filter(Boolean),
         targetChangedSinceBase: (f) => !gitOk(['diff', '--quiet', base, 'HEAD', '--', f]),
         isEditableDoc,
       });
@@ -338,7 +360,7 @@ async function main() {
     const r = await fn({ fetch, apiKey, model: spec.model, system, blocks, maxTokens, effort: spec.effort, stream, retry: { onRetry: (m) => warn(`${label}: ${m}`) } });
     usage.log(label, spec.model, r.usage);
     debug(`${label} raw output`, r.text);
-    if (/max_tokens|length/.test(String(r.stopReason))) warn(`${label}: output cut off by the token budget (stop_reason=${r.stopReason})`);
+    if (r.truncated) warn(`${label}: output cut off by the token budget (stop_reason=${r.stopReason})`);
     return r;
   };
 
@@ -382,22 +404,33 @@ async function main() {
       sourcePatches: a.source_files.flatMap((f) => [earlierByPath.get(f)?.patch, patchByPath.get(f)?.patch]).filter(Boolean).join('\n\n'),
       current: readCurrent(a.path) ?? '',
     });
+  // { content } with content null when unparseable, or { error } once the call's retries are spent.
   const writeDoc = async (a, extra = '') => {
-    const r = await callModel(models.writer, `writer ${a.path}`, {
-      system: L.WRITER_SYSTEM,
-      blocks: [{ text: prefix, cache: true }, { text: docPart(a) + extra }],
-      maxTokens: cfg.writer_max_tokens,
-      stream: models.writer.provider === 'anthropic',
-    });
-    return L.parseWriterOutput(r.text);
+    try {
+      const r = await callModel(models.writer, `writer ${a.path}`, {
+        system: L.WRITER_SYSTEM,
+        blocks: [{ text: prefix, cache: true }, { text: docPart(a) + extra }],
+        maxTokens: cfg.writer_max_tokens,
+        stream: models.writer.provider === 'anthropic',
+      });
+      return { content: L.parseWriterOutput(r.text) };
+    } catch (error) {
+      warn(`writer ${a.path} failed (${error.message})`);
+      return { error };
+    }
   };
   // The first call alone warms the cached prefix; the rest run three at a time against it.
   const drafts = [];
   const written = writable.length ? [await writeDoc(writable[0])] : [];
   written.push(...(await L.mapConcurrent(writable.slice(1), cfg.writer_concurrency, (a) => writeDoc(a))));
+  // Nothing written and an outage among the causes: fail so the cursor stays put and a later run
+  // retries. A request-specific failure (a 400, a timeout) would fail every run, so it is held back.
+  if (written.length && written.every((w) => w.error) && written.some((w) => L.isTransientError(w.error)))
+    throw written.find((w) => L.isTransientError(w.error)).error;
   writable.forEach((a, i) => {
-    if (written[i] == null) heldBack.push({ path: a.path, reason: 'writer output could not be parsed as a fenced file' });
-    else drafts.push({ ...a, content: written[i], current: readCurrent(a.path) });
+    if (written[i].error) heldBack.push({ path: a.path, reason: `writer call failed: ${written[i].error.message}` });
+    else if (written[i].content == null) heldBack.push({ path: a.path, reason: 'writer output could not be parsed as a fenced file' });
+    else drafts.push({ ...a, content: written[i].content, current: readCurrent(a.path) });
   });
   log(`Writer: ${drafts.length} draft(s)` + (heldBack.length ? `, ${heldBack.length} held back` : ''));
 
@@ -438,8 +471,9 @@ async function main() {
     log(`Correction pass for ${toCorrect.length} file(s)`);
     const corrected = await L.mapConcurrent(toCorrect, cfg.writer_concurrency, (d) => writeDoc(d, '\n\n' + L.correctionPart({ draft: d.content, issues: d.check.issues })));
     toCorrect.forEach((d, i) => {
-      if (corrected[i] == null) warn(`correction for ${d.path} unparseable; keeping the first draft`);
-      candidates.push({ ...d, content: corrected[i] ?? d.content, corrected: corrected[i] != null });
+      const content = corrected[i].content;
+      if (content == null) warn(`correction for ${d.path} ${corrected[i].error ? 'failed' : 'unparseable'}; keeping the first draft`);
+      candidates.push({ ...d, content: content ?? d.content, corrected: content != null });
     });
   }
 
@@ -496,7 +530,7 @@ async function main() {
     target: TARGET_BRANCH,
     from,
     to: head,
-    commitCount: Math.min(count, cfg.max_commits),
+    commitCount: count,
     capped,
     runUrl: RUN_URL,
     kept,

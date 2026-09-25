@@ -28,10 +28,11 @@ import {
   splitUnifiedDiff,
   packDiff,
   extractRelativeLinks,
+  resolveLink,
   buildManifest,
   renderManifest,
   planCarryForward,
-  allOwnCommits,
+  foreignBranchCommit,
   collectAgentsFiles,
   loadGuidelines,
   lineDiff,
@@ -61,6 +62,7 @@ import {
   BOT_EMAIL,
   fetchRetry,
   isRetryableStatus,
+  isTransientError,
   costOf,
   narrativeOutline,
   defuseRefs,
@@ -122,6 +124,15 @@ describe('config', () => {
     const parsed = parseYamlSubset(CFG_TEXT);
     assert.deepEqual(parsed.never_touch, ['docs/superpowers/specs/**']);
     assert.deepEqual(parsed.extra_ignore, ['flake.lock', 'apps/cms/src/app/(payload)/admin/importMap.js']);
+  });
+
+  test('inline flow lists parse like block lists', () => {
+    const parsed = parseYamlSubset(`doc_paths: [docs/**/*.md, 'README.md', "apps/*/README.md"]  # inline\nnever_touch: []\n`);
+    assert.deepEqual(parsed.doc_paths, ['docs/**/*.md', 'README.md', 'apps/*/README.md']);
+    assert.deepEqual(parsed.never_touch, []);
+    const isDoc = makeIsEditableDocPath(loadConfig('doc_paths: [docs/**/*.md, README.md]\n'));
+    assert.ok(isDoc('docs/a/b.md'));
+    assert.ok(isDoc('README.md'));
   });
 
   test('applies defaults and appends extra_ignore to the built-in list', () => {
@@ -394,6 +405,15 @@ describe('manifest', () => {
     const md = '[a](../api/architecture.md#flow) ![i](./img/x.png) [u](https://x.y/z) [m](mailto:a@b) [h](#top) [t](<docs/spaced file.md> "title")';
     assert.deepEqual(extractRelativeLinks(md), ['../api/architecture.md', './img/x.png', 'docs/spaced file.md']);
   });
+  test('resolves links relative to the file, from the repo root for a leading slash, decoded', () => {
+    assert.equal(resolveLink('docs/api/a.md', '../b.md'), 'docs/b.md');
+    assert.equal(resolveLink('docs/api/a.md', '/docs/setup.md'), 'docs/setup.md');
+    assert.equal(resolveLink('README.md', 'my%20file.md'), 'my file.md');
+    assert.equal(resolveLink('README.md', '100%.md'), '100%.md');
+    assert.equal(resolveLink('docs/a.md', '../../x.md'), null);
+    assert.equal(resolveLink('README.md', '/'), '.');
+  });
+
   test('builds and renders entries with heading, size and link directories', () => {
     const m = buildManifest([
       { path: 'docs/api/architecture.md', content: '# API architecture\n\nSee [crm](../civi-crm/architecture.md) and [root](../../README.md).\n' },
@@ -407,9 +427,36 @@ describe('manifest', () => {
 });
 
 describe('carry forward (read side) and guidelines', () => {
-  test('ownership check and restore/stale plan', () => {
-    assert.ok(allOwnCommits([{ email: BOT_EMAIL }]));
-    assert.ok(!allOwnCommits([{ email: BOT_EMAIL }, { email: 'human@x' }]));
+  test('ownership: tool commits, merges and doc additions or edits by others are fine; anything else is foreign', () => {
+    const m = (path) => ({ status: 'M', path });
+    const changes = {
+      tool: [m('docs/a.md')],
+      merge: [m('src/x.ts')],
+      suggestion: [m('docs/a.md'), { status: 'A', path: 'docs/new.md' }],
+      code: [m('docs/a.md'), m('src/x.ts')],
+      removal: [{ status: 'D', path: 'docs/a.md' }],
+      rename: [{ status: 'R', path: 'docs/b.md', oldPath: 'docs/a.md' }],
+    };
+    const opts = { changesOf: (sha) => changes[sha], isEditableDoc: (f) => f.startsWith('docs/') };
+    const tool = { sha: 'tool', email: BOT_EMAIL, authorEmail: BOT_EMAIL, parents: ['p'] };
+    const web = 'noreply@github.com';
+    const merge = { sha: 'merge', email: web, authorEmail: 'human@x', parents: ['a', 'b'] };
+    const suggestion = { sha: 'suggestion', email: web, authorEmail: 'human@x', parents: ['p'] };
+    const code = { sha: 'code', email: 'human@x', authorEmail: 'human@x', parents: ['p'] };
+    assert.equal(foreignBranchCommit([], opts), null, 'nothing on top of the target');
+    assert.equal(foreignBranchCommit([tool], opts), null);
+    assert.equal(foreignBranchCommit([merge, suggestion, tool], opts), null);
+    assert.equal(foreignBranchCommit([code, tool], opts), code);
+    assert.equal(foreignBranchCommit([suggestion], opts), suggestion, 'a branch the tool never committed to');
+    const rebased = { ...tool, email: web };
+    assert.equal(foreignBranchCommit([rebased], opts), null, '"Update with rebase" keeps the tool as author');
+    for (const sha of ['removal', 'rename']) {
+      const c = { ...suggestion, sha };
+      assert.equal(foreignBranchCommit([c, tool], opts), c, `carry-forward cannot carry a ${sha}`);
+    }
+  });
+
+  test('restore/stale plan', () => {
     const plan = planCarryForward({
       branchFiles: ['docs/a.md', 'docs/b.md', 'src/x.ts'],
       targetChangedSinceBase: (f) => f === 'docs/b.md',
@@ -598,6 +645,30 @@ describe('model calls over fetch', () => {
     assert.deepEqual(sent.reasoning, { effort: 'low' });
   });
 
+  test('failures carry their status; outages are transient, request problems and timeouts are not', async () => {
+    const bad = (status) => async () => ({ ok: false, status, text: async () => 'x' });
+    const err = (p) => p.then(() => null, (e) => e);
+    const a400 = await err(anthropicCall({ fetch: bad(400), apiKey: 'k', model: 'claude-sonnet-5', system: 'S', blocks: [{ text: 'x' }], maxTokens: 1 }));
+    const o529 = await err(openaiCall({ fetch: bad(529), apiKey: 'k', model: 'gpt-6-luna', system: 'S', blocks: [{ text: 'x' }], maxTokens: 1, retry: { retries: 0 } }));
+    assert.equal(a400.status, 400);
+    assert.equal(isTransientError(a400), false);
+    assert.equal(isTransientError(o529), true);
+    assert.equal(isTransientError(new TypeError('fetch failed')), true);
+    assert.equal(isTransientError(Object.assign(new Error('t'), { name: 'TimeoutError' })), false);
+  });
+
+  test('both providers report truncation by the output budget', async () => {
+    const oa = (reason) => async () => ({ ok: true, status: 200, json: async () => ({ output: [], usage: {}, status: reason ? 'incomplete' : 'completed', ...(reason ? { incomplete_details: { reason } } : {}) }) });
+    const call = (f) => openaiCall({ fetch: f, apiKey: 'k', model: 'gpt-6-luna', system: 'S', blocks: [{ text: 'a' }], maxTokens: 1 });
+    assert.equal((await call(oa('max_output_tokens'))).truncated, true);
+    assert.equal((await call(oa('content_filter'))).truncated, false);
+    assert.equal((await call(oa())).truncated, false);
+    const an = (stop_reason) => async () => ({ ok: true, status: 200, json: async () => ({ content: [], usage: {}, stop_reason }) });
+    const acall = (f) => anthropicCall({ fetch: f, apiKey: 'k', model: 'claude-sonnet-5', system: 'S', blocks: [{ text: 'a' }], maxTokens: 1 });
+    assert.equal((await acall(an('max_tokens'))).truncated, true);
+    assert.equal((await acall(an('end_turn'))).truncated, false);
+  });
+
   test('usage log prices Opus 5.5 cache reads at 5% and reports unpriced models', () => {
     const lines = [];
     const warns = [];
@@ -704,6 +775,18 @@ describe('gates', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test('gate 2: only added prose lines are checked; root-relative and encoded links resolve', () => {
+    const exists = (p) => ['docs/setup.md', 'docs/my file.md'].includes(p);
+    const current = '# g\n\n[old](./already-broken.md)\n';
+    const ok = gateLinks(
+      { path: 'docs/g.md', content: current + '[s](/docs/setup.md) [f](my%20file.md)\n\n```md\n[example](./not-a-real-file.md)\n```\n' },
+      { existsInTree: exists, current }
+    );
+    assert.deepEqual(ok, { ok: true });
+    const bad = gateLinks({ path: 'docs/g.md', content: current + '[new](./nope.md)\n' }, { existsInTree: exists, current });
+    assert.match(bad.reason, /broken relative link\(s\): \.\/nope\.md$/);
   });
 
   test('gate 3: size sanity measured from the target branch with the 400-byte floor', () => {

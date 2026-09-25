@@ -123,8 +123,8 @@ export const MARKER_RUNS = 20;
 
 // -------------------------------------------------------------------- config ---
 
-// Minimal YAML subset: `key: value`, `key:` followed by `- item` lines, `#` comments. Enough for
-// the documented config and nothing more, so the tool stays dependency-free.
+// Minimal YAML subset: `key: value`, `key: [a, b]`, `key:` followed by `- item` lines, `#`
+// comments. Enough for the documented config and nothing more, so the tool stays dependency-free.
 export function parseYamlSubset(text) {
   const out = {};
   let currentList = null;
@@ -140,9 +140,13 @@ export function parseYamlSubset(text) {
     const kv = line.match(/^([\w_]+):\s*(.*)$/);
     if (!kv) continue;
     const [, key, val] = kv;
+    const flow = val.match(/^\[(.*)\]$/);
     if (val === '') {
       out[key] = [];
       currentList = key;
+    } else if (flow) {
+      out[key] = flow[1].split(',').map(unquote).filter(Boolean);
+      currentList = null;
     } else {
       const scalar = unquote(val);
       out[key] = /^\d+$/.test(scalar) ? Number(scalar) : scalar;
@@ -324,10 +328,8 @@ const normalisePr = (pr) => ({
   user: pr.user?.login ?? '',
 });
 
-// Links commits to PRs: subjects first (free), then `commits/{sha}/pulls` for the rest, marking
-// every commit of a found PR as linked so one PR costs one lookup. `api` is injected:
-// { pr(n), pullsForCommit(sha), prCommits(n) }; prCommits returns { sha, subject, email } per
-// commit. A rebase merge rewrites SHAs, so a PR commit also matches by subject + author email.
+// One lookup covers every commit of a found PR, matched by SHA or, since a rebase merge rewrites
+// SHAs, by subject + author email.
 export async function collectPrs(commits, api, { targetBranch, rollingBranch, maxLookups = DEFAULTS.max_pr_lookups }) {
   const linked = new Map(); // sha -> pr number
   const prs = new Map(); // number -> normalised pr
@@ -444,7 +446,7 @@ export function buildNarrative({ commits, linked, prs, targetBranch, from, to, b
   }
   const title = `## Change narrative (${targetBranch}, ${short(from)}..${short(to)})`;
   const notes = [];
-  if (capped) notes.push(`Range capped at the newest ${DEFAULTS.max_commits} commits.`);
+  if (capped) notes.push(`Range capped at the newest ${DEFAULTS.max_commits} first-parent commits.`);
 
   const render = () => {
     const out = [title];
@@ -572,6 +574,20 @@ export function extractRelativeLinks(md) {
   return out;
 }
 
+// Repo-relative path a link in `fromFile` points at, or null when it leaves the repo. A leading
+// `/` is the repo root, as GitHub renders it.
+export function resolveLink(fromFile, link) {
+  let target = link;
+  try {
+    target = decodeURIComponent(link);
+  } catch {
+    // a literal `%` that is not an escape
+  }
+  const dir = path.dirname(fromFile);
+  const resolved = path.normalize(target.startsWith('/') ? target.slice(1) || '.' : path.join(dir === '.' ? '' : dir, target));
+  return resolved === '..' || resolved.startsWith('../') ? null : resolved;
+}
+
 export function firstHeading(md) {
   const m = md.match(/^#\s+(.+?)\s*$/m);
   return m ? m[1] : '';
@@ -580,11 +596,10 @@ export function firstHeading(md) {
 export function buildManifest(files) {
   return files
     .map(({ path: p, content }) => {
-      const dir = path.dirname(p);
       const dirs = new Set();
       for (const l of extractRelativeLinks(content)) {
-        const resolved = path.normalize(path.join(dir === '.' ? '' : dir, l));
-        if (resolved.startsWith('..')) continue;
+        const resolved = resolveLink(p, l);
+        if (resolved == null) continue;
         const d = path.dirname(resolved);
         dirs.add(d === '.' ? '/' : d + '/');
       }
@@ -602,8 +617,14 @@ export function renderManifest(manifest) {
 
 // -------------------------------------------------------------- carry forward ---
 
-export function allOwnCommits(commits) {
-  return commits.every((c) => isBotEmail(c.email));
+// The commit that makes the rolling branch someone else's work, or null when the tool may rebuild
+// it. "Update branch" merges and others' doc additions or edits are fine: carry-forward keeps
+// those, but it cannot carry a delete or rename. `changesOf(sha)` is parseNameStatus output.
+export function foreignBranchCommit(commits, { changesOf, isEditableDoc }) {
+  if (!commits.length) return null;
+  if (!commits.some((c) => isBotEmail(c.email) || isBotEmail(c.authorEmail))) return commits[0];
+  const carriable = (ch) => (ch.status === 'A' || ch.status === 'M') && isEditableDoc(ch.path);
+  return commits.find((c) => !isBotEmail(c.email) && c.parents.length < 2 && !changesOf(c.sha).every(carriable)) ?? null;
 }
 
 // Read side of 5.12 step 1: which unmerged rolling-branch edits to restore on top of the target.
@@ -1050,6 +1071,11 @@ export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // 529 is Anthropic's "overloaded".
 export const isRetryableStatus = (status) => status === 429 || status === 529 || (status >= 500 && status <= 599);
 
+// An outage rather than something about the request: a retryable status or a network error. A
+// timeout is not, since a long doc times out every time.
+export const isTransientError = (e) =>
+  e?.status == null ? e?.name !== 'TimeoutError' && e?.name !== 'AbortError' : isRetryableStatus(e.status);
+
 // One retry on 5xx/429/529 or a network error, honouring Retry-After up to `maxDelayMs`. Each
 // attempt gets its own timeout. A timeout is not retried: it already spent the whole budget.
 export async function fetchRetry(f, url, init, { timeoutMs, retries = 1, baseDelayMs = 3000, maxDelayMs = 30_000, sleep: wait = sleep, onRetry = () => {} } = {}) {
@@ -1094,7 +1120,7 @@ export async function anthropicCall({ fetch: f, apiKey, model, system, blocks, m
     },
     { timeoutMs, ...retry }
   );
-  if (!res.ok) throw new Error(`Anthropic ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw Object.assign(new Error(`Anthropic ${res.status}: ${await res.text()}`), { status: res.status });
   const usage = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
   const readUsage = (u) => {
     if (!u) return;
@@ -1110,6 +1136,7 @@ export async function anthropicCall({ fetch: f, apiKey, model, system, blocks, m
       text: (data.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join(''),
       usage,
       stopReason: data.stop_reason,
+      truncated: data.stop_reason === 'max_tokens',
     };
   }
   // Only text deltas reach the file; thinking deltas are dropped.
@@ -1121,9 +1148,9 @@ export async function anthropicCall({ fetch: f, apiKey, model, system, blocks, m
     else if (ev.type === 'message_delta') {
       readUsage(ev.usage);
       if (ev.delta?.stop_reason) stopReason = ev.delta.stop_reason;
-    } else if (ev.type === 'error') throw new Error(`Anthropic stream error: ${JSON.stringify(ev.error ?? ev)}`);
+    } else if (ev.type === 'error') throw Object.assign(new Error(`Anthropic stream error: ${JSON.stringify(ev.error ?? ev)}`), { status: 500 });
   }
-  return { text, usage, stopReason };
+  return { text, usage, stopReason, truncated: stopReason === 'max_tokens' };
 }
 
 export async function openaiCall({ fetch: f, apiKey, model, system, blocks, maxTokens, effort, timeoutMs = 600_000, retry = {} }) {
@@ -1145,7 +1172,7 @@ export async function openaiCall({ fetch: f, apiKey, model, system, blocks, maxT
     },
     { timeoutMs, ...retry }
   );
-  if (!res.ok) throw new Error(`OpenAI ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw Object.assign(new Error(`OpenAI ${res.status}: ${await res.text()}`), { status: res.status });
   const data = await res.json();
   const text =
     (data.output ?? [])
@@ -1160,6 +1187,7 @@ export async function openaiCall({ fetch: f, apiKey, model, system, blocks, maxT
     text,
     usage: { input: (data.usage?.input_tokens ?? 0) - cached, cacheRead: cached, cacheWrite: 0, output: data.usage?.output_tokens ?? 0 },
     stopReason: data.incomplete_details?.reason ?? data.status,
+    truncated: data.incomplete_details?.reason === 'max_output_tokens',
   };
 }
 
@@ -1240,12 +1268,17 @@ export function gateNonEmpty(file, { current }) {
 }
 
 // `existsInTree(path)` answers for the post-edit tree: files created this run plus the checkout.
-export function gateLinks(file, { existsInTree }) {
-  const dir = path.dirname(file.path);
+// Only lines this run added are checked: a link that was already broken is not the edit's fault.
+export function gateLinks(file, { existsInTree, current }) {
+  const lines = file.content.split('\n');
+  const inFence = fencedLines(lines);
   const broken = [];
-  for (const l of extractRelativeLinks(file.content)) {
-    const resolved = path.normalize(path.join(dir === '.' ? '' : dir, l));
-    if (resolved.startsWith('..') || !existsInTree(resolved)) broken.push(l);
+  for (const i of addedLineIndexes(lineDiff(current ?? '', file.content))) {
+    if (inFence.has(i)) continue;
+    for (const l of extractRelativeLinks(lines[i])) {
+      const resolved = resolveLink(file.path, l);
+      if (resolved == null || !existsInTree(resolved)) broken.push(l);
+    }
   }
   return broken.length ? { ok: false, reason: `broken relative link(s): ${[...new Set(broken)].join(', ')}` } : { ok: true };
 }
@@ -1360,7 +1393,8 @@ export function runGates(files, ctx) {
   const existsInTree = (p) => created.has(p) || existsInCheckout(p);
 
   for (const f of stage1) {
-    let r = gateLinks(f, { existsInTree });
+    // Against the target, like gate 3, so links carried from earlier runs are re-checked.
+    let r = gateLinks(f, { existsInTree, current: readTarget(f.path) });
     if (!r.ok) {
       drop(f, 2, r.reason);
       continue;
