@@ -366,7 +366,7 @@ async function main() {
     const r = await fn({ fetch, apiKey, model: spec.model, system, blocks, maxTokens, effort: spec.effort, stream, retry: { onRetry: (m) => warn(`${label}: ${m}`) } });
     usage.log(label, spec.model, r.usage);
     debug(`${label} raw output`, r.text);
-    if (/max_tokens|length/.test(String(r.stopReason))) warn(`${label}: output cut off by the token budget (stop_reason=${r.stopReason})`);
+    if (r.truncated) warn(`${label}: output cut off by the token budget (stop_reason=${r.stopReason})`);
     return r;
   };
 

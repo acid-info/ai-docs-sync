@@ -644,6 +644,18 @@ describe('model calls over fetch', () => {
     assert.deepEqual(sent.reasoning, { effort: 'low' });
   });
 
+  test('both providers report truncation by the output budget', async () => {
+    const oa = (reason) => async () => ({ ok: true, status: 200, json: async () => ({ output: [], usage: {}, status: reason ? 'incomplete' : 'completed', ...(reason ? { incomplete_details: { reason } } : {}) }) });
+    const call = (f) => openaiCall({ fetch: f, apiKey: 'k', model: 'gpt-6-luna', system: 'S', blocks: [{ text: 'a' }], maxTokens: 1 });
+    assert.equal((await call(oa('max_output_tokens'))).truncated, true);
+    assert.equal((await call(oa('content_filter'))).truncated, false);
+    assert.equal((await call(oa())).truncated, false);
+    const an = (stop_reason) => async () => ({ ok: true, status: 200, json: async () => ({ content: [], usage: {}, stop_reason }) });
+    const acall = (f) => anthropicCall({ fetch: f, apiKey: 'k', model: 'claude-sonnet-5', system: 'S', blocks: [{ text: 'a' }], maxTokens: 1 });
+    assert.equal((await acall(an('max_tokens'))).truncated, true);
+    assert.equal((await acall(an('end_turn'))).truncated, false);
+  });
+
   test('usage log prices Opus 5.5 cache reads at 5% and reports unpriced models', () => {
     const lines = [];
     const warns = [];

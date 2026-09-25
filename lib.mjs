@@ -1133,6 +1133,7 @@ export async function anthropicCall({ fetch: f, apiKey, model, system, blocks, m
       text: (data.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join(''),
       usage,
       stopReason: data.stop_reason,
+      truncated: data.stop_reason === 'max_tokens',
     };
   }
   // Only text deltas reach the file; thinking deltas are dropped.
@@ -1146,7 +1147,7 @@ export async function anthropicCall({ fetch: f, apiKey, model, system, blocks, m
       if (ev.delta?.stop_reason) stopReason = ev.delta.stop_reason;
     } else if (ev.type === 'error') throw new Error(`Anthropic stream error: ${JSON.stringify(ev.error ?? ev)}`);
   }
-  return { text, usage, stopReason };
+  return { text, usage, stopReason, truncated: stopReason === 'max_tokens' };
 }
 
 export async function openaiCall({ fetch: f, apiKey, model, system, blocks, maxTokens, effort, timeoutMs = 600_000, retry = {} }) {
@@ -1183,6 +1184,7 @@ export async function openaiCall({ fetch: f, apiKey, model, system, blocks, maxT
     text,
     usage: { input: (data.usage?.input_tokens ?? 0) - cached, cacheRead: cached, cacheWrite: 0, output: data.usage?.output_tokens ?? 0 },
     stopReason: data.incomplete_details?.reason ?? data.status,
+    truncated: data.incomplete_details?.reason === 'max_output_tokens',
   };
 }
 
