@@ -283,8 +283,15 @@ async function main() {
   if (remoteSha) {
     const base = git(['merge-base', 'HEAD', remote]);
     const branchCommits = L.parseGitLog(git(['log', `--format=${L.GIT_LOG_FORMAT}`, `${base}..${remote}`]));
-    if (!L.allOwnCommits(branchCommits))
-      throw new Error(`origin/${cfg.branch} has commits not authored by the tool; refusing to build on it. Rename or delete that branch.`);
+    const foreign = L.foreignBranchCommit(branchCommits, {
+      changesOf: (sha) => L.parseNameStatus(git(['diff-tree', '--no-commit-id', '--name-status', '-r', '-z', '-M', sha])),
+      isEditableDoc,
+    });
+    if (foreign)
+      throw new Error(
+        `origin/${cfg.branch} has ${foreign.short} "${foreign.subject}" (${foreign.email}), which is neither the tool's nor a doc addition or edit; ` +
+          `refusing to build on it. Rename or delete that branch.`
+      );
     if (openPr) {
       carryBase = base;
       const plan = L.planCarryForward({

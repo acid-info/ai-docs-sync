@@ -187,8 +187,11 @@ with the full diff inline. A repo that wants them hand-maintained lists them in 
   target's new version. Either way the PR is updated, so it never keeps a conflicting edit. After
   the PR is merged or closed nothing is carried: merged edits are already in the target, and
   closing means "not now". The next publishing run opens a fresh PR on the same branch.
-- **Ownership.** If the branch holds a commit the tool did not make, the run refuses before any
-  paid call. Rename or delete that branch.
+- **Ownership.** The branch may hold, besides the tool's commits, merges (the PR's "Update
+  branch" button) and other people's commits that only add or edit editable docs (a reviewer's
+  suggestion); those edits are carried forward like the tool's own. Any other commit (code, a
+  deleted or renamed doc), or a branch the tool never committed to, makes the run refuse before
+  any paid call. Rename or delete that branch.
 - The PR body lists, per file: the triage reason, the checker's verdict and issues, and whether
   a correction pass addressed them. It also lists carried edits, discarded edits and whether
   they were redone, held-back files and the gate that stopped them, new links and raw HTML,
@@ -312,7 +315,7 @@ dispatched directly. End-to-end changes have to be proved on a real push in a co
 - The cursor is a git ref, movable only with `contents: write`. Nothing read from a PR body
   drives control flow; the rolling PR is located by head and base, not by marker.
 - The force-push target is validated (not the target or default branch, safe charset) and the
-  existing branch must consist solely of the tool's own commits.
+  existing branch must hold nothing but the tool's commits, merges and doc additions or edits.
 - No write credential is persisted in the checkout. The token and API keys are removed from the
   tool's environment at startup, so they are not passed to `setup_command`, prettier or git.
   Only the push and cursor-update child processes receive the token, via environment, and they

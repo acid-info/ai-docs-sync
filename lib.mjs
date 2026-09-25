@@ -602,8 +602,14 @@ export function renderManifest(manifest) {
 
 // -------------------------------------------------------------- carry forward ---
 
-export function allOwnCommits(commits) {
-  return commits.every((c) => isBotEmail(c.email));
+// The commit that makes the rolling branch someone else's work, or null when the tool may rebuild
+// it. "Update branch" merges and others' doc additions or edits are fine: carry-forward keeps
+// those, but it cannot carry a delete or rename. `changesOf(sha)` is parseNameStatus output.
+export function foreignBranchCommit(commits, { changesOf, isEditableDoc }) {
+  if (!commits.length) return null;
+  if (!commits.some((c) => isBotEmail(c.email) || isBotEmail(c.authorEmail))) return commits[0];
+  const carriable = (ch) => (ch.status === 'A' || ch.status === 'M') && isEditableDoc(ch.path);
+  return commits.find((c) => !isBotEmail(c.email) && c.parents.length < 2 && !changesOf(c.sha).every(carriable)) ?? null;
 }
 
 // Read side of 5.12 step 1: which unmerged rolling-branch edits to restore on top of the target.

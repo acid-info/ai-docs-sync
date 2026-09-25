@@ -31,7 +31,7 @@ import {
   buildManifest,
   renderManifest,
   planCarryForward,
-  allOwnCommits,
+  foreignBranchCommit,
   collectAgentsFiles,
   loadGuidelines,
   lineDiff,
@@ -407,9 +407,36 @@ describe('manifest', () => {
 });
 
 describe('carry forward (read side) and guidelines', () => {
-  test('ownership check and restore/stale plan', () => {
-    assert.ok(allOwnCommits([{ email: BOT_EMAIL }]));
-    assert.ok(!allOwnCommits([{ email: BOT_EMAIL }, { email: 'human@x' }]));
+  test('ownership: tool commits, merges and doc additions or edits by others are fine; anything else is foreign', () => {
+    const m = (path) => ({ status: 'M', path });
+    const changes = {
+      tool: [m('docs/a.md')],
+      merge: [m('src/x.ts')],
+      suggestion: [m('docs/a.md'), { status: 'A', path: 'docs/new.md' }],
+      code: [m('docs/a.md'), m('src/x.ts')],
+      removal: [{ status: 'D', path: 'docs/a.md' }],
+      rename: [{ status: 'R', path: 'docs/b.md', oldPath: 'docs/a.md' }],
+    };
+    const opts = { changesOf: (sha) => changes[sha], isEditableDoc: (f) => f.startsWith('docs/') };
+    const tool = { sha: 'tool', email: BOT_EMAIL, authorEmail: BOT_EMAIL, parents: ['p'] };
+    const web = 'noreply@github.com';
+    const merge = { sha: 'merge', email: web, authorEmail: 'human@x', parents: ['a', 'b'] };
+    const suggestion = { sha: 'suggestion', email: web, authorEmail: 'human@x', parents: ['p'] };
+    const code = { sha: 'code', email: 'human@x', authorEmail: 'human@x', parents: ['p'] };
+    assert.equal(foreignBranchCommit([], opts), null, 'nothing on top of the target');
+    assert.equal(foreignBranchCommit([tool], opts), null);
+    assert.equal(foreignBranchCommit([merge, suggestion, tool], opts), null);
+    assert.equal(foreignBranchCommit([code, tool], opts), code);
+    assert.equal(foreignBranchCommit([suggestion], opts), suggestion, 'a branch the tool never committed to');
+    const rebased = { ...tool, email: web };
+    assert.equal(foreignBranchCommit([rebased], opts), null, '"Update with rebase" keeps the tool as author');
+    for (const sha of ['removal', 'rename']) {
+      const c = { ...suggestion, sha };
+      assert.equal(foreignBranchCommit([c, tool], opts), c, `carry-forward cannot carry a ${sha}`);
+    }
+  });
+
+  test('restore/stale plan', () => {
     const plan = planCarryForward({
       branchFiles: ['docs/a.md', 'docs/b.md', 'src/x.ts'],
       targetChangedSinceBase: (f) => f === 'docs/b.md',
