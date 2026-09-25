@@ -444,7 +444,7 @@ export function buildNarrative({ commits, linked, prs, targetBranch, from, to, b
   }
   const title = `## Change narrative (${targetBranch}, ${short(from)}..${short(to)})`;
   const notes = [];
-  if (capped) notes.push(`Range capped at the newest ${DEFAULTS.max_commits} commits.`);
+  if (capped) notes.push(`Range capped at the newest ${DEFAULTS.max_commits} first-parent commits.`);
 
   const render = () => {
     const out = [title];

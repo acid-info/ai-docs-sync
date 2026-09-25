@@ -215,14 +215,19 @@ async function main() {
   }
   let from = git(['rev-parse', range.from]);
   let capped = false;
-  const count = Number(git(['rev-list', '--count', `${from}..HEAD`]));
+  let count = Number(git(['rev-list', '--count', `${from}..HEAD`]));
   if (count > cfg.max_commits) {
-    const shas = git(['rev-list', `--max-count=${cfg.max_commits + 1}`, 'HEAD']).split('\n');
-    from = shas[shas.length - 1];
-    capped = true;
-    log(`Range has ${count} commits; capped at the newest ${cfg.max_commits} (from ${from.slice(0, 7)}). Backfill in slices with since=.`);
+    // First-parent, so the new start is on the target's own line and never before the old one.
+    const line = git(['rev-list', '--first-parent', `--max-count=${cfg.max_commits + 1}`, `${from}..HEAD`]).split('\n');
+    if (line.length > cfg.max_commits) {
+      from = line[line.length - 1];
+      capped = true;
+      const all = count;
+      count = Number(git(['rev-list', '--count', `${from}..HEAD`]));
+      log(`Range has ${all} commits; capped at the newest ${cfg.max_commits} first-parent commits (from ${from.slice(0, 7)}). Backfill in slices with since=.`);
+    }
   }
-  log(`Range ${from.slice(0, 7)}..${head.slice(0, 7)} (${range.source}, ${Math.min(count, cfg.max_commits)} commits)`);
+  log(`Range ${from.slice(0, 7)}..${head.slice(0, 7)} (${range.source}, ${count} commits)`);
   if (from === head) {
     moveCursor('Empty range; nothing to do');
     return;
@@ -519,7 +524,7 @@ async function main() {
     target: TARGET_BRANCH,
     from,
     to: head,
-    commitCount: Math.min(count, cfg.max_commits),
+    commitCount: count,
     capped,
     runUrl: RUN_URL,
     kept,

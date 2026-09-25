@@ -229,7 +229,7 @@ git push -f origin <sha>:refs/ai-docs-sync/cursor
 
 To re-process a range without touching the cursor first, dispatch the workflow with
 `since=<sha>`. `since` must be an ancestor of the target head. Ranges are capped at the newest
-250 commits, so backfill a long history in slices.
+250 commits on the target's first-parent line, so backfill a long history in slices.
 
 ## Changing a model
 
