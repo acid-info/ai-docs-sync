@@ -572,6 +572,20 @@ export function extractRelativeLinks(md) {
   return out;
 }
 
+// Repo-relative path a link in `fromFile` points at, or null when it leaves the repo. A leading
+// `/` is the repo root, as GitHub renders it.
+export function resolveLink(fromFile, link) {
+  let target = link;
+  try {
+    target = decodeURIComponent(link);
+  } catch {
+    // a literal `%` that is not an escape
+  }
+  const dir = path.dirname(fromFile);
+  const resolved = path.normalize(target.startsWith('/') ? target.slice(1) || '.' : path.join(dir === '.' ? '' : dir, target));
+  return resolved === '..' || resolved.startsWith('../') ? null : resolved;
+}
+
 export function firstHeading(md) {
   const m = md.match(/^#\s+(.+?)\s*$/m);
   return m ? m[1] : '';
@@ -580,11 +594,10 @@ export function firstHeading(md) {
 export function buildManifest(files) {
   return files
     .map(({ path: p, content }) => {
-      const dir = path.dirname(p);
       const dirs = new Set();
       for (const l of extractRelativeLinks(content)) {
-        const resolved = path.normalize(path.join(dir === '.' ? '' : dir, l));
-        if (resolved.startsWith('..')) continue;
+        const resolved = resolveLink(p, l);
+        if (resolved == null) continue;
         const d = path.dirname(resolved);
         dirs.add(d === '.' ? '/' : d + '/');
       }
@@ -1246,12 +1259,17 @@ export function gateNonEmpty(file, { current }) {
 }
 
 // `existsInTree(path)` answers for the post-edit tree: files created this run plus the checkout.
-export function gateLinks(file, { existsInTree }) {
-  const dir = path.dirname(file.path);
+// Only lines this run added are checked: a link that was already broken is not the edit's fault.
+export function gateLinks(file, { existsInTree, current }) {
+  const lines = file.content.split('\n');
+  const inFence = fencedLines(lines);
   const broken = [];
-  for (const l of extractRelativeLinks(file.content)) {
-    const resolved = path.normalize(path.join(dir === '.' ? '' : dir, l));
-    if (resolved.startsWith('..') || !existsInTree(resolved)) broken.push(l);
+  for (const i of addedLineIndexes(lineDiff(current ?? '', file.content))) {
+    if (inFence.has(i)) continue;
+    for (const l of extractRelativeLinks(lines[i])) {
+      const resolved = resolveLink(file.path, l);
+      if (resolved == null || !existsInTree(resolved)) broken.push(l);
+    }
   }
   return broken.length ? { ok: false, reason: `broken relative link(s): ${[...new Set(broken)].join(', ')}` } : { ok: true };
 }
@@ -1366,7 +1384,8 @@ export function runGates(files, ctx) {
   const existsInTree = (p) => created.has(p) || existsInCheckout(p);
 
   for (const f of stage1) {
-    let r = gateLinks(f, { existsInTree });
+    // Against the target, like gate 3, so links carried from earlier runs are re-checked.
+    let r = gateLinks(f, { existsInTree, current: readTarget(f.path) });
     if (!r.ok) {
       drop(f, 2, r.reason);
       continue;

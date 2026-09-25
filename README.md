@@ -29,8 +29,8 @@ swapping a model is one edit here, not one per consumer.
    before any API call.
 6. Triage picks the affected docs. A writer model rewrites each one, a checker model reviews
    the rewrite and can demand at most one correction pass.
-7. Mechanical gates run on every edit: the path allowlist, link resolution, dash and attribution
-   scans, size sanity, a banner for guideline-file edits, optional prettier.
+7. Mechanical gates run on every edit: the path allowlist, resolution of added links, dash and
+   attribution scans, size sanity, a banner for guideline-file edits, optional prettier.
 8. The result is pushed to one rolling branch and one rolling PR per repo, updated in place.
    Edits not yet merged survive the next run. The cursor advances whatever the outcome.
 

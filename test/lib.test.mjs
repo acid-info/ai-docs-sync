@@ -28,6 +28,7 @@ import {
   splitUnifiedDiff,
   packDiff,
   extractRelativeLinks,
+  resolveLink,
   buildManifest,
   renderManifest,
   planCarryForward,
@@ -394,6 +395,15 @@ describe('manifest', () => {
     const md = '[a](../api/architecture.md#flow) ![i](./img/x.png) [u](https://x.y/z) [m](mailto:a@b) [h](#top) [t](<docs/spaced file.md> "title")';
     assert.deepEqual(extractRelativeLinks(md), ['../api/architecture.md', './img/x.png', 'docs/spaced file.md']);
   });
+  test('resolves links relative to the file, from the repo root for a leading slash, decoded', () => {
+    assert.equal(resolveLink('docs/api/a.md', '../b.md'), 'docs/b.md');
+    assert.equal(resolveLink('docs/api/a.md', '/docs/setup.md'), 'docs/setup.md');
+    assert.equal(resolveLink('README.md', 'my%20file.md'), 'my file.md');
+    assert.equal(resolveLink('README.md', '100%.md'), '100%.md');
+    assert.equal(resolveLink('docs/a.md', '../../x.md'), null);
+    assert.equal(resolveLink('README.md', '/'), '.');
+  });
+
   test('builds and renders entries with heading, size and link directories', () => {
     const m = buildManifest([
       { path: 'docs/api/architecture.md', content: '# API architecture\n\nSee [crm](../civi-crm/architecture.md) and [root](../../README.md).\n' },
@@ -731,6 +741,18 @@ describe('gates', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test('gate 2: only added prose lines are checked; root-relative and encoded links resolve', () => {
+    const exists = (p) => ['docs/setup.md', 'docs/my file.md'].includes(p);
+    const current = '# g\n\n[old](./already-broken.md)\n';
+    const ok = gateLinks(
+      { path: 'docs/g.md', content: current + '[s](/docs/setup.md) [f](my%20file.md)\n\n```md\n[example](./not-a-real-file.md)\n```\n' },
+      { existsInTree: exists, current }
+    );
+    assert.deepEqual(ok, { ok: true });
+    const bad = gateLinks({ path: 'docs/g.md', content: current + '[new](./nope.md)\n' }, { existsInTree: exists, current });
+    assert.match(bad.reason, /broken relative link\(s\): \.\/nope\.md$/);
   });
 
   test('gate 3: size sanity measured from the target branch with the 400-byte floor', () => {
