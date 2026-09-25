@@ -59,6 +59,28 @@ import {
   approxTokens,
   isBotEmail,
   BOT_EMAIL,
+  fetchRetry,
+  isRetryableStatus,
+  costOf,
+  narrativeOutline,
+  defuseRefs,
+  inlineCode,
+  codeBlock,
+  commitScope,
+  commitMessage,
+  prTitle,
+  gitAuthEnv,
+  parseMarker,
+  renderMarker,
+  lastRunFor,
+  regenerateFrom,
+  renderStaleBlock,
+  triageUser,
+  writerPrefix,
+  checkerUser,
+  TRIAGE_SYSTEM,
+  renderPrBody,
+  PR_BODY_MAX,
 } from '../lib.mjs';
 
 const CFG_TEXT = `
@@ -162,6 +184,9 @@ describe('allowlist predicate', () => {
     assert.equal(ok('content/blog/post.md'), false, 'outside doc_paths');
     assert.equal(ok('docs/../../x.md'), false);
     assert.equal(ok('docs/./x.md'), false);
+    const broad = makeIsEditableDocPath(loadConfig('doc_paths:\n  - "**/*.md"\n'));
+    assert.equal(broad('.ai-docs-sync/README.md'), false, "the tool's own checkout in the consumer tree");
+    assert.equal(broad('docs/x.md'), true);
   });
 
   test('a symlinked file or directory component is rejected on disk', () => {
@@ -486,15 +511,13 @@ describe('checker parser and the single-correction rule', () => {
 });
 
 describe('providers', () => {
-  test('checker runs on the other provider when both keys exist, another model otherwise', () => {
-    const both = pickModels({ anthropic: 'a', openai: 'o' });
-    assert.equal(both.writer.provider, 'anthropic');
-    assert.equal(both.checker.provider, 'openai');
-    const one = pickModels({ anthropic: 'a' });
-    assert.equal(one.checker.provider, 'anthropic');
-    assert.notEqual(one.checker.model, one.writer.model);
-    const oa = pickModels({ openai: 'o' });
-    assert.notEqual(oa.checker.model, oa.writer.model);
+  test('triage and checker are OpenAI, the writer is Anthropic, and both keys are required', () => {
+    const models = pickModels({ anthropic: 'a', openai: 'o' });
+    assert.deepEqual(models.triage, { provider: 'openai', model: 'gpt-6-luna', effort: 'low' });
+    assert.deepEqual(models.writer, { provider: 'anthropic', model: 'claude-opus-5-5', effort: 'medium' });
+    assert.deepEqual(models.checker, { provider: 'openai', model: 'gpt-6-sol', effort: 'medium' });
+    assert.throws(() => pickModels({ anthropic: 'a' }), /OPENAI_API_KEY/);
+    assert.throws(() => pickModels({ openai: 'o' }), /ANTHROPIC_API_KEY/);
     assert.throws(() => pickModels({}), /Missing required env var/);
   });
   test('every model in DEFAULTS is priced and effort-gated correctly', () => {
@@ -503,7 +526,7 @@ describe('providers', () => {
       assert.ok(PRICES[v], `${v} priced`);
       if (v.startsWith('claude-')) assert.ok(EFFORT_MODELS.test(v), `${v} accepts effort`);
     }
-    assert.deepEqual(effortConfig('claude-opus-5', 'low'), { output_config: { effort: 'low' } });
+    assert.deepEqual(effortConfig('claude-opus-5-5', 'medium'), { output_config: { effort: 'medium' } });
     assert.deepEqual(effortConfig('claude-haiku-4-5', 'low'), {});
   });
 });
@@ -568,22 +591,23 @@ describe('model calls over fetch', () => {
       sent = JSON.parse(init.body);
       return { ok: true, status: 200, json: async () => ({ output: [{ content: [{ type: 'output_text', text: '{"files":[]}' }] }], usage: { input_tokens: 50, output_tokens: 5, input_tokens_details: { cached_tokens: 20 } }, status: 'completed' }) };
     };
-    const r = await openaiCall({ fetch, apiKey: 'k', model: 'gpt-5.6-terra', system: 'S', blocks: [{ text: 'a' }, { text: 'b' }], maxTokens: 100 });
+    const r = await openaiCall({ fetch, apiKey: 'k', model: 'gpt-6-luna', system: 'S', blocks: [{ text: 'a' }, { text: 'b' }], maxTokens: 100, effort: 'low' });
     assert.equal(r.text, '{"files":[]}');
     assert.deepEqual(r.usage, { input: 30, cacheRead: 20, cacheWrite: 0, output: 5 });
     assert.equal(sent.input[1].content, 'a\n\nb');
+    assert.deepEqual(sent.reasoning, { effort: 'low' });
   });
 
-  test('usage log prices cache reads at a tenth and reports unpriced models', () => {
+  test('usage log prices Opus 5.5 cache reads at 5% and reports unpriced models', () => {
     const lines = [];
     const warns = [];
     const u = makeUsageLog((l) => lines.push(l), (w) => warns.push(w));
-    u.log('writer', 'claude-opus-5', { input: 1_000_000, cacheRead: 1_000_000, cacheWrite: 0, output: 100_000 });
-    assert.equal(u.total().toFixed(2), (5 + 0.5 + 2.5).toFixed(2));
+    u.log('writer', 'claude-opus-5-5', { input: 1_000_000, cacheRead: 1_000_000, cacheWrite: 0, output: 100_000 });
+    assert.equal(u.total().toFixed(2), (4 + 0.2 + 2).toFixed(2));
     u.log('x', 'mystery', { input: 1, cacheRead: 0, cacheWrite: 0, output: 1 });
     assert.equal(warns.length, 1);
     assert.deepEqual(u.unpriced(), ['mystery']);
-    assert.match(lines[0], /\[cost\] writer \(claude-opus-5\)/);
+    assert.match(lines[0], /\[cost\] writer \(claude-opus-5-5\)/);
   });
 
   test('mapConcurrent bounds parallelism and keeps order', async () => {
@@ -717,6 +741,14 @@ describe('gates', () => {
     assert.deepEqual(v.flags.find((f) => f.kind === 'vendor_names').detail, ['Anthropic']);
   });
 
+  test('gate 5: tags inside code spans and fences are text, not HTML; URLs there are still flagged', () => {
+    const content = '| `--greeting <word>` | x |\n\n````html\n<script src="https://cdn.example/a.js"></script>\n```\n<b>still fenced</b>\n````\n\nAfter <em>prose</em>.\n';
+    const r = gateFlags({ path: 'docs/cli.md', content }, { current: '', isGuideline: false });
+    const kinds = Object.fromEntries(r.flags.map((f) => [f.kind, f.detail]));
+    assert.deepEqual(kinds.raw_html, ['<em>', '</em>']);
+    assert.deepEqual(kinds.new_urls, ['https://cdn.example/a.js']);
+  });
+
   test('gate 6: strict formatting replaces content or drops on failure; off is a no-op', () => {
     assert.equal(gateFormat({ content: 'x' }, { format: { mode: 'off' } }).content, 'x');
     assert.equal(gateFormat({ content: 'x' }, { format: { mode: 'strict', run: () => ({ ok: true, content: 'X' }) } }).content, 'X');
@@ -757,5 +789,255 @@ describe('defuse', () => {
     assert.equal(defuse('thanks @octocat, fixes #12 and Closes  #13'), 'thanks @\u200boctocat, fixes #\u200b12 and Closes #\u200b13');
     assert.equal(defuse('a'.repeat(500), 20).length, 20);
     assert.equal(defuse('a\n\nb  c'), 'a b c');
+  });
+});
+
+// ------------------------------------------------------------------- phase 4 ---
+
+describe('defusing for GitHub text', () => {
+  test('every closing-keyword form and raw HTML is neutralised', () => {
+    assert.equal(defuse('Fixes: #7'), 'Fixes: #​7');
+    assert.equal(defuse('resolves acme/web#9'), 'resolves acme/web#​9');
+    assert.equal(defuse('closed https://github.com/a/b/issues/3'), 'closed​ https://github.com/a/b/issues/3');
+    assert.equal(defuse('see #12'), 'see #12', 'a plain reference is left alone');
+    assert.equal(defuse('x <!-- hide --> <img src=y>'), 'x &lt;!-- hide --&gt; &lt;img src=y&gt;');
+  });
+
+  test('inline code and fenced blocks cannot be broken out of', () => {
+    assert.equal(inlineCode('a`b'), '``a`b``');
+    assert.equal(inlineCode('`x'), '`` `x ``');
+    assert.equal(inlineCode('@octocat'), '`@​octocat`');
+    const block = codeBlock('+ ```js\n+ fixes #4\n', 'diff');
+    assert.ok(block.startsWith('````diff\n') && block.endsWith('\n````'));
+    assert.match(block, /fixes #​4/);
+    assert.equal(defuseRefs('line one\n@team'), 'line one\n@​team', 'multiline text keeps its newlines');
+  });
+});
+
+describe('retries', () => {
+  const res = (status, headers = {}) => ({ ok: status < 400, status, headers: new Headers(headers), body: null, text: async () => String(status) });
+
+  test('one retry on 5xx, 429 and 529, honouring Retry-After; 4xx is final', async () => {
+    assert.ok(isRetryableStatus(500) && isRetryableStatus(529) && isRetryableStatus(429));
+    assert.ok(!isRetryableStatus(401) && !isRetryableStatus(422));
+    const waits = [];
+    const sleep = async (ms) => waits.push(ms);
+    let calls = 0;
+    const flaky = async (url, init) => {
+      assert.ok(init.signal instanceof AbortSignal, 'a timeout signal on every attempt');
+      return ++calls === 1 ? res(529, { 'retry-after': '2' }) : res(200);
+    };
+    assert.equal((await fetchRetry(flaky, 'u', {}, { timeoutMs: 1000, sleep })).status, 200);
+    assert.deepEqual(waits, [2000]);
+
+    calls = 0;
+    const down = async () => (calls++, res(503));
+    assert.equal((await fetchRetry(down, 'u', {}, { timeoutMs: 1000, sleep })).status, 503, 'the second failure is returned, not retried again');
+    assert.equal(calls, 2);
+
+    calls = 0;
+    const denied = async () => (calls++, res(401));
+    assert.equal((await fetchRetry(denied, 'u', {}, { timeoutMs: 1000, sleep })).status, 401);
+    assert.equal(calls, 1);
+  });
+
+  test('network errors retry once, timeouts never', async () => {
+    const sleep = async () => {};
+    let calls = 0;
+    const reset = async () => {
+      if (++calls === 1) throw new TypeError('fetch failed');
+      return res(200);
+    };
+    assert.equal((await fetchRetry(reset, 'u', {}, { timeoutMs: 1000, sleep })).status, 200);
+    calls = 0;
+    const slow = async () => {
+      calls++;
+      throw Object.assign(new Error('timed out'), { name: 'TimeoutError' });
+    };
+    await assert.rejects(() => fetchRetry(slow, 'u', {}, { timeoutMs: 1000, sleep }), /timed out/);
+    assert.equal(calls, 1);
+  });
+
+  test('model calls go through the retry', async () => {
+    let calls = 0;
+    const fetch = async () =>
+      ++calls === 1
+        ? res(529)
+        : { ok: true, status: 200, json: async () => ({ content: [{ type: 'text', text: 'hi' }], usage: { input_tokens: 1, output_tokens: 1 }, stop_reason: 'end_turn' }) };
+    const r = await anthropicCall({ fetch, apiKey: 'k', model: 'claude-sonnet-5', system: 'S', blocks: [{ text: 'x' }], maxTokens: 10, retry: { sleep: async () => {} } });
+    assert.equal(r.text, 'hi');
+    assert.equal(calls, 2);
+  });
+});
+
+describe('publishing helpers', () => {
+  test('commit scope, subject and body follow the fixed template', () => {
+    assert.equal(commitScope('docs/web/sync'), 'web');
+    assert.equal(commitScope('docs-sync'), 'repo');
+    const msg = commitMessage({ scope: 'web', from: 'a'.repeat(40), to: 'b'.repeat(40), target: 'develop', files: ['docs/x.md'], carried: ['README.md'], runUrl: 'https://r' });
+    assert.match(msg, /^docs\(web\): sync with aaaaaaa\.\.bbbbbbb\n\nRange: a{40}\.\.b{40} on develop\n\nFiles:\n- docs\/x\.md\n- README\.md \(carried forward\)\n\nRun: https:\/\/r\n$/);
+    assert.ok(!/co-authored|generated/i.test(msg));
+    assert.equal(prTitle({ scope: 'web', target: 'develop', to: 'c'.repeat(40) }), 'docs(web): sync docs with develop (up to ccccccc)');
+  });
+
+  test('the push credential is an env-only extraheader that disables stored credentials', () => {
+    const env = gitAuthEnv('tok');
+    assert.equal(env.GIT_CONFIG_KEY_0, 'http.https://github.com/.extraheader');
+    assert.equal(env.GIT_CONFIG_VALUE_0, `AUTHORIZATION: basic ${Buffer.from('x-access-token:tok').toString('base64')}`);
+    assert.equal(env.GIT_CONFIG_KEY_1, 'credential.helper');
+    assert.equal(env.GIT_CONFIG_VALUE_1, '');
+    assert.equal(env.GIT_TERMINAL_PROMPT, '0');
+  });
+
+  test('marker round-trips, cannot be closed from inside, and ignores junk', () => {
+    const runs = [{ at: '2026-09-23T00:00:00Z', from: 'abc', to: 'def', files: ['docs/a-->b.md'] }];
+    const marker = renderMarker(runs);
+    assert.equal(marker.indexOf('-->'), marker.length - 3, 'only the real terminator');
+    assert.deepEqual(parseMarker(`text\n${marker}\n`), runs);
+    assert.deepEqual(parseMarker('<!-- ai-docs-sync {"v":1,"runs":[{"from":"zz;rm","files":["../x.md","ok.md",3]}]} -->'), [{ at: '', from: '', to: '', files: ['ok.md'] }]);
+    assert.deepEqual(parseMarker('no marker'), []);
+    assert.deepEqual(parseMarker('<!-- ai-docs-sync {broken -->'), []);
+    const many = Array.from({ length: 30 }, (_, i) => ({ at: '', from: String(i), to: '', files: [] }));
+    assert.equal(renderMarker(many).match(/"from":/g).length, 20, 'keeps the last 20');
+    const hist = [{ from: 'f1', to: '1', files: ['a.md'] }, { from: 'f2', to: '2', files: ['a.md', 'b.md'] }];
+    assert.equal(lastRunFor(hist, 'a.md').to, '2');
+    assert.equal(regenerateFrom(hist, 'a.md', 'base'), 'f1', 'the earliest run that touched it');
+    assert.equal(regenerateFrom(hist, 'c.md', 'base'), 'base');
+  });
+
+  test('narrative outline has PR titles and subjects only', () => {
+    const commits = [
+      { sha: 's1', short: 's1', email: 'a@x', parents: ['p'], subject: 'feat: one', body: 'long body' },
+      { sha: 's2', short: 's2', email: BOT_EMAIL, parents: ['p'], subject: 'docs: sync', body: '' },
+      { sha: 's3', short: 's3', email: 'b@x', parents: ['p'], subject: 'fix: loose', body: '' },
+    ];
+    const outline = narrativeOutline({ commits, linked: new Map([['s1', 5]]), prs: new Map([[5, { title: 'PR five' }]]) });
+    assert.deepEqual(outline, [
+      { pr: { number: 5, title: 'PR five' }, commits: [{ short: 's1', subject: 'feat: one' }] },
+      { pr: null, commits: [{ short: 's3', subject: 'fix: loose' }] },
+    ]);
+  });
+});
+
+describe('PR body', () => {
+  const base = () => ({
+    target: 'develop',
+    from: 'a'.repeat(40),
+    to: 'b'.repeat(40),
+    commitCount: 3,
+    runUrl: 'https://github.com/o/r/actions/runs/1',
+    kept: [
+      {
+        path: 'docs/api.md',
+        action: 'update',
+        reason: 'Endpoint moved; thanks @alice, fixes #12 <!--',
+        check: { action: 'correct', issues: [{ severity: 'must', note: 'Claims hCaptcha <b>still</b> runs' }] },
+        corrected: true,
+        dashesFixed: 2,
+        flags: [{ kind: 'new_urls', detail: ['https://evil.example/@x'] }],
+      },
+      {
+        path: 'AGENTS.md',
+        action: 'update',
+        reason: 'Commands changed',
+        check: { action: 'proceed', unchecked: true, issues: [] },
+        flags: [{ kind: 'guideline_edit', detail: '--- a/AGENTS.md\n+++ b/AGENTS.md\n@@ -1 +1 @@\n-old\n+new ``` closes #3\n' }],
+      },
+    ],
+    carried: [{ path: 'README.md', run: { from: '1111111aaa', to: '2222222bbb' } }],
+    stale: [
+      { path: 'docs/old.md', since: 'c'.repeat(40), redone: false },
+      { path: 'docs/api.md', since: 'd'.repeat(40), redone: true },
+    ],
+    dropped: [{ path: 'docs/bad.md', gate: 2, reason: 'broken relative link(s): ./@nope.md' }],
+    heldBack: [{ path: 'docs/huge.md', reason: 'too large for a full rewrite in v1' }],
+    deleteCandidates: [{ path: 'docs/gone.md', reason: 'App removed' }],
+    overflow: [{ path: 'docs/later.md', reason: 'also stale' }],
+    omittedDiff: ['big/file.ts'],
+    outline: [{ pr: { number: 153, title: 'refactor: move funnel, closes #99' }, commits: [{ short: 'abc1234', subject: 'refactor @bob' }] }],
+    usage: { entries: [{ label: 'triage', model: 'claude-sonnet-5', input: 10, cacheRead: 0, output: 5, cost: 0.001 }], total: 0.001, unpriced: [] },
+    runs: [{ at: 't', from: 'a', to: 'b', files: ['docs/api.md', 'AGENTS.md'] }],
+  });
+
+  test('renders every section, bannered guideline diff first, everything defused', () => {
+    const body = renderPrBody(base());
+    assert.ok(body.startsWith('> [!WARNING]\n> **Guideline file edited: `AGENTS.md`.**'), 'banner at the very top');
+    assert.match(body, /````diff\n[\s\S]*\+new ``` closes #​3\n````/, 'fence outlasts the backticks in the diff, keyword defused');
+    for (const h of ['Edited this run', 'Carried forward', 'Earlier edits discarded because `develop` changed the file', 'Held back', 'New links, raw HTML and vendor names to check', 'Delete candidates', 'Also likely affected', 'Diff not shown', 'Commits and PRs in this range', 'API usage'])
+      assert.ok(body.includes(`\n#### ${h}`), h);
+    assert.ok(!/^#{1,3} /m.test(body), 'no heading above level 4');
+    assert.ok(!body.includes('Nothing merges without a human'));
+    assert.match(body, /thanks @​alice, fixes #​12 &lt;!--/);
+    assert.match(body, /addressed in the correction pass:\n    - \[must\] Claims hCaptcha &lt;b&gt;still&lt;\/b&gt; runs/);
+    assert.match(body, /Checker: \*\*unchecked\*\*/);
+    assert.match(body, /2 line\(s\) had en\/em dashes replaced/);
+    assert.match(body, /`README\.md` \(from `1111111\.\.2222222`\)/);
+    assert.match(body, /`docs\/old\.md`: triage was asked again and did not select it\. To force it, re-run with `since=c{40}`/);
+    assert.match(body, /`docs\/api\.md`: redone this run on top of the new version/);
+    assert.match(body, /gate 2: broken relative link\(s\): \.\/@​nope\.md/);
+    assert.match(body, /new URLs: `https:\/\/evil\.example\/@​x`/);
+    assert.match(body, /- #153 refactor: move funnel, closes #​99\n  - `abc1234` refactor @​bob/);
+    assert.match(body, /Total ~\$0\.0010/);
+    assert.ok(!/<!--(?! ai-docs-sync )/.test(body), 'the only HTML comment is the marker');
+    assert.equal(body.match(/-->/g).length, 1);
+    assert.deepEqual(parseMarker(body), base().runs);
+  });
+
+  test('over the cap the narrative is trimmed first and the marker survives', () => {
+    const outline = [{ pr: null, commits: Array.from({ length: 3000 }, (_, i) => ({ short: `c${i}`, subject: `subject ${i} `.repeat(4) })) }];
+    const body = renderPrBody({ ...base(), outline });
+    assert.ok(body.length <= PR_BODY_MAX, `${body.length}`);
+    assert.match(body, /more line\(s\) not shown/);
+    assert.match(body, /#### API usage/, 'sections after the narrative are kept');
+    assert.deepEqual(parseMarker(body), base().runs);
+
+    const huge = base();
+    huge.kept[1].flags[0].detail = '+x\n'.repeat(40_000);
+    const cut = renderPrBody(huge);
+    assert.ok(cut.length <= PR_BODY_MAX);
+    assert.match(cut, /\(truncated\)/);
+    assert.deepEqual(parseMarker(cut), base().runs);
+  });
+
+  test('usage entries carry their cost', () => {
+    assert.equal(costOf('claude-sonnet-5', { input: 1e6, cacheRead: 0, cacheWrite: 0, output: 0 }), 2);
+    assert.equal(costOf('mystery', { input: 1, cacheRead: 0, cacheWrite: 0, output: 0 }), null);
+    const u = makeUsageLog();
+    u.log('triage', 'claude-sonnet-5', { input: 1e6, cacheRead: 0, cacheWrite: 0, output: 0 });
+    assert.equal(u.entries[0].cost, 2);
+  });
+});
+
+describe('stale edits go back to triage', () => {
+  const stale = () =>
+    renderStaleBlock({
+      docs: ['docs/api.md'],
+      from: 'a'.repeat(40),
+      to: 'b'.repeat(40),
+      commits: [{ short: 'c0ffee1', subject: 'feat(server): read PORT' }],
+      diff: '--- FILE: src/server.js (M) ---\n+const PORT = 8080;',
+      current: { 'docs/api.md': '# HTTP API\n\nListens on 3000.\n' },
+    });
+
+  test('the block names the docs, the earlier range, its commits and its diff', () => {
+    const text = stale();
+    assert.match(text, /^<stale_edits>\n.*discarded: docs\/api\.md\n/);
+    assert.match(text, /\(aaaaaaa\.\.bbbbbbb, already on the target branch before this range\)/);
+    assert.match(text, /Commits:\n- c0ffee1 feat\(server\): read PORT/);
+    assert.match(text, /<earlier_diff>\n--- FILE: src\/server\.js \(M\) ---\n\+const PORT = 8080;\n<\/earlier_diff>\n/);
+    assert.match(text, /<stale_doc path="docs\/api\.md">\n# HTTP API\n\nListens on 3000\.\n<\/stale_doc>\n<\/stale_edits>$/, 'triage sees the current text');
+    assert.match(renderStaleBlock({ docs: ['docs/big.md'], current: { 'docs/big.md': null } }), /<stale_doc path="docs\/big\.md">\(too large to include\)<\/stale_doc>/);
+    assert.match(renderStaleBlock({ docs: ['docs/api.md'] }), /inside <diff>/, 'no earlier diff when the range already covers it');
+    assert.equal(renderStaleBlock({ docs: [] }), '');
+  });
+
+  test('triage, writer prefix and checker all carry it; nothing changes without it', () => {
+    const base = { guidelines: 'g', narrative: 'n', diff: 'd', manifest: 'm' };
+    assert.equal(triageUser(base), triageUser({ ...base, stale: '' }));
+    assert.ok(!triageUser(base).includes('stale_edits'));
+    assert.ok(triageUser({ ...base, stale: stale() }).endsWith(stale()), 'last, so the prefix up to the manifest is unchanged');
+    assert.equal(writerPrefix({ ...base, stale: stale() }), triageUser({ ...base, stale: stale() }));
+    assert.match(checkerUser({ narrative: 'n', diff: 'd', docs: [], stale: stale() }), /<earlier_diff>/);
+    assert.match(TRIAGE_SYSTEM, /<stale_edits> block is present, re-evaluate every doc it lists/);
   });
 });

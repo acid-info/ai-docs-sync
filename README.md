@@ -9,12 +9,10 @@ Humans merge it.
 Consumers call this repo as a **reusable workflow** pinned to `@v1`. Upgrading the tool or
 swapping a model is one edit here, not one per consumer.
 
-> **Status: not yet publishing.** Everything up to and including the mechanical gates is
-> implemented and unit-tested (config, allowlist, cursor range, narrative, diff packing,
-> manifest, carry-forward read side, triage, writer, checker, correction, gates 0-6). The
-> publishing stage (branch rebuild, push, rolling PR, cursor move, PR body) is not: a run stops
-> after the gates, prints what it would push and exits 1 unless `DRY_RUN=1`. Do not add this to
-> a repo until `v1` is tagged.
+> **Status: feature-complete, not yet tagged.** Every stage is implemented and unit-tested,
+> and publishing has been run end to end against a sandbox repo from a local checkout. It has
+> not yet run inside GitHub Actions. Do not add it to a repo until `v1` is tagged (see
+> "Releasing").
 
 ## How it works
 
@@ -35,6 +33,10 @@ swapping a model is one edit here, not one per consumer.
    scans, size sanity, a banner for guideline-file edits, optional prettier.
 8. The result is pushed to one rolling branch and one rolling PR per repo, updated in place.
    Edits not yet merged survive the next run. The cursor advances whatever the outcome.
+
+Retries: every GitHub and model call has a timeout and is retried once, with backoff, on a
+5xx, a 429 or Anthropic's 529. A second failure fails the run, and the cursor stays put so the
+next push picks the range up again.
 
 The tool has **zero npm dependencies** and runs on Node 22's global `fetch`. Keep it that way:
 no build step, no `package.json`.
@@ -93,18 +95,18 @@ Pass the secrets explicitly. Do **not** use `secrets: inherit`: the tool has no 
 an `NPM_TOKEN` or a database URL.
 
 `@v1` is a moving tag. A consumer that wants immutability pins the commit SHA instead; the
-reusable workflow checks itself out at `github.job_workflow_sha` either way.
+reusable workflow checks itself out at `job.workflow_sha` either way, and refuses to run if
+that is empty.
 
 ### Secrets
 
 | Secret | Required |
 | --- | --- |
-| `ANTHROPIC_API_KEY` | At least one of the two |
-| `OPENAI_API_KEY` | At least one of the two |
+| `ANTHROPIC_API_KEY` | Yes. The writer calls Claude Opus 5.5 |
+| `OPENAI_API_KEY` | Yes. Triage calls GPT-6 Luna; the checker calls GPT-6 Sol |
 | `DOCS_SYNC_TOKEN` | No. Escape hatch, see below |
 
-With both keys set, the checker runs on a different provider from the writer. With one, both
-passes use that provider.
+Triage runs at low effort. The writer and the checker run at medium.
 
 `GITHUB_TOKEN` is supplied by Actions and is enough for the default path, with **one repo
 setting**: a repo admin enables "Allow GitHub Actions to create and approve pull requests"
@@ -172,16 +174,82 @@ Guideline files (`AGENTS.md`, `CLAUDE.md`, anything in `guidelines_files`) are e
 other doc when `doc_paths` covers them. An edit to one gets a banner at the top of the PR body
 with the full diff inline. A repo that wants them hand-maintained lists them in `never_touch`.
 
+## The rolling PR
+
+- The rolling branch is always **the target head plus one commit** by `github-actions[bot]`
+  holding every edit still open. That commit is built with git plumbing in a throwaway index,
+  so the working tree never changes. It is pushed with `--force-with-lease` pinned to the
+  branch state the tool inspected.
+- **Carry-forward.** While a PR from the rolling branch into the target is open, its edits are
+  carried into the next run. If the target has since changed one of those files, that edit is
+  discarded and the file goes back to triage together with the earlier code changes the edit
+  documented. Triage can select it again, in which case the edit is redone on top of the
+  target's new version. Either way the PR is updated, so it never keeps a conflicting edit. After
+  the PR is merged or closed nothing is carried: merged edits are already in the target, and
+  closing means "not now". The next publishing run opens a fresh PR on the same branch.
+- **Ownership.** If the branch holds a commit the tool did not make, the run refuses before any
+  paid call. Rename or delete that branch.
+- The PR body lists, per file: the triage reason, the checker's verdict and issues, and whether
+  a correction pass addressed them. It also lists carried edits, discarded edits and whether
+  they were redone, held-back files and the gate that stopped them, new links and raw HTML,
+  delete candidates, triage overflow, the commits and PRs in the range, and API cost. A
+  guideline-file edit is bannered at the top with its full diff.
+- Everything model- or narrative-derived in the body is defused: no live `@mentions`, no
+  closing keywords, no raw HTML. The body is capped at 60,000 characters. A hidden
+  `<!-- ai-docs-sync {...} -->` marker keeps the last 20 runs; it is informational only and
+  never drives control flow.
+- A `docs-sync/gates` commit status marks the branch head, because a PR pushed with
+  `GITHUB_TOKEN` runs no CI.
+
+## The cursor
+
+`refs/ai-docs-sync/cursor` in the consumer repo points at the last target-branch commit the
+tool finished with. Each run diffs `cursor..HEAD` and moves the cursor to `HEAD` whenever it
+reaches a decision, whatever that decision is:
+
+- a docs-only push (the loop guard);
+- no code files left after ignores;
+- a triage that finds nothing affected;
+- nothing surviving the gates;
+- a dry run;
+- a published PR.
+
+A run that fails leaves the cursor where it was. The ref never triggers `on: push`, and only
+someone with `contents: write` can move it.
+
+Read it or move it by hand:
+
+```bash
+git ls-remote origin refs/ai-docs-sync/cursor
+git push -f origin <sha>:refs/ai-docs-sync/cursor
+```
+
+To re-process a range without touching the cursor first, dispatch the workflow with
+`since=<sha>`. `since` must be an ancestor of the target head. Ranges are capped at the newest
+250 commits, so backfill a long history in slices.
+
 ## Changing a model
 
 Edit `DEFAULTS` in `lib.mjs`, then check **two** other places in the same file:
 
 1. **`PRICES`**: add the new model, or the cost line reports it as unpriced and excludes it from
    the total.
-2. **`EFFORT_MODELS`**: a model-family regex gating `output_config.effort`. A model string that
-   does not match silently loses the effort config rather than erroring.
+2. **`EFFORT_MODELS`**: a model-family regex gating Anthropic `output_config.effort`. A Claude
+   model string that does not match silently loses the effort config rather than erroring.
+   OpenAI calls send `reasoning.effort` whenever the stage has an effort set.
 
-Then tag: `git tag -f v1 && git push -f origin v1`. Every consumer picks it up on its next run.
+Then release it (below). Every consumer picks it up on its next run.
+
+## Releasing
+
+`v1` is a moving tag on `master`. After a change is merged:
+
+```bash
+git checkout master && git pull && git tag -f v1 && git push -f origin v1
+```
+
+Only the group that controls `ai-review`'s tags should be able to push this one (see "Security
+model"). Consumers that want immutability pin a commit SHA instead.
 
 ## Running it locally
 
@@ -194,24 +262,36 @@ time and never reads `process.env` or touches the network. `docs-sync.mjs` is th
 does.
 
 To run the tool itself, `cd` into a full clone of the consumer repo checked out at its target
-branch (the config is read from `.github/docs-sync.yml` there) and set the env the workflow
-would:
+branch; the config is read from `.github/docs-sync.yml` there. Fetch first, so the
+rolling branch's remote-tracking ref is current. In Actions the checkout does this. Then set
+the env the workflow would:
+
+```bash
+git fetch origin && git checkout --detach origin/develop
+```
 
 ```bash
 GITHUB_TOKEN=$(gh auth token) REPO=owner/name TARGET_BRANCH=develop SINCE=<sha> \
-  ANTHROPIC_API_KEY=sk-ant-junk TRIAGE_ONLY=1 node /path/to/ai-docs-sync/docs-sync.mjs
+  ANTHROPIC_API_KEY=sk-ant-junk OPENAI_API_KEY=sk-junk TRIAGE_ONLY=1 node /path/to/ai-docs-sync/docs-sync.mjs
 ```
+
+> **Only `TRIAGE_ONLY=1` writes nothing.** Every other run writes to the real repo as soon as
+> it reaches a decision. A `DRY_RUN=1`, or even a run that exits at the loop guard, moves the
+> cursor ref. A plain run force-pushes the rolling branch and opens or updates the PR. Pushes
+> go to `https://github.com/<REPO>.git` with `GITHUB_TOKEN`, passed to git through the
+> environment only and never through a credential helper.
 
 | Env | Effect |
 | --- | --- |
 | `SINCE` | Start of the diff range; must be an ancestor of the target head. Skips the cursor read. |
-| `TRIAGE_ONLY=1` | Stops after triage. With a junk API key everything free runs (range, changed files, narrative, packed diff, manifest, guidelines) and the run dies at a 401 having spent nothing. |
-| `DRY_RUN=1` | Runs the model calls and gates (paid), prints the surviving diffs, exits 0 without pushing. |
+| `TRIAGE_ONLY=1` | Stops after triage and never writes. With junk API keys everything free runs (range, changed files, narrative, packed diff, carry-forward, manifest, guidelines) and the run dies at a 401 having spent nothing. |
+| `DRY_RUN=1` | Runs the model calls and gates (paid), prints the branch, the diffs, the PR title and body, and moves the cursor. Pushes no branch, touches no PR. |
 | `DEBUG=1` | Logs every model's raw output and stack traces to stderr. |
 | `PUSH_BEFORE`, `PUSH_FORCED` | What the workflow passes from the push event; used only when there is no cursor ref. |
+| `RUN_URL` | Linked from the PR body, the commit message and the commit status. |
 
-`GITHUB_TOKEN` is needed for read-only calls even locally: the cursor ref, the default branch and
-the commit-to-PR lookups that build the change narrative.
+`GITHUB_TOKEN` is needed even for `TRIAGE_ONLY`: the cursor ref, the default branch, the open
+rolling PR and the commit-to-PR lookups that build the change narrative are all API reads.
 
 The reusable workflow itself has no runnable form without a caller: `workflow_call` cannot be
 dispatched directly. End-to-end changes have to be proved on a real push in a consumer repo.

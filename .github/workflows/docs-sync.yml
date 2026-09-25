@@ -42,7 +42,12 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           EVENT_NAME: ${{ github.event_name }}
           REPO: ${{ github.repository }}
+          TOOL_REPO: ${{ job.workflow_repository }}
+          TOOL_SHA: ${{ job.workflow_sha }}
         run: |
+          # An empty ref makes actions/checkout fall back to the tool repo's default branch, which
+          # would silently run code the consumer never pinned.
+          if [ -z "$TOOL_REPO" ] || [ -z "$TOOL_SHA" ]; then echo "Cannot tell which ai-docs-sync commit was called (job.workflow_*); refusing to run."; exit 1; fi
           t="$INPUT_TARGET"
           if [ -z "$t" ]; then
             if gh api "repos/$REPO/branches/develop" >/dev/null 2>&1; then t=develop
@@ -65,8 +70,8 @@ jobs:
       - if: steps.target.outputs.skip != '1'
         uses: actions/checkout@v4          # the tool, at the ref the consumer pinned
         with:
-          repository: acid-info/ai-docs-sync
-          ref: ${{ github.job_workflow_sha }}
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
           path: .ai-docs-sync
           persist-credentials: false
       - if: steps.target.outputs.skip != '1'
@@ -84,4 +89,6 @@ jobs:
           PUSH_FORCED: ${{ github.event.forced }}
           SINCE: ${{ inputs.since }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+          # "Re-run with debug logging" also logs every model's raw output.
+          DEBUG: ${{ runner.debug }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

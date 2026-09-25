@@ -2,12 +2,13 @@
 // Entry point: env parsing and stage orchestration. Everything pure lives in lib.mjs; this is the
 // only file that reads process.env, runs git or touches the network.
 //
-// Env: GITHUB_TOKEN, REPO ("owner/name"), TARGET_BRANCH, ANTHROPIC_API_KEY and/or OPENAI_API_KEY.
+// Env: GITHUB_TOKEN, REPO ("owner/name"), TARGET_BRANCH, ANTHROPIC_API_KEY, OPENAI_API_KEY.
 // Optional: PUSH_BEFORE, PUSH_FORCED, SINCE, DRY_RUN, TRIAGE_ONLY, DEBUG, RUN_URL.
 // Runs from the target-branch checkout with full history (fetch-depth: 0).
 
 import { execFileSync, execSync } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync, lstatSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, lstatSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as L from './lib.mjs';
 
@@ -36,14 +37,17 @@ const debug = (label, text) => {
 
 // ---------------------------------------------------------------------- helpers ---
 
-function git(args, { quiet = false, input } = {}) {
-  return execFileSync('git', args, {
+// `raw` keeps the trailing newline: file contents must round-trip byte for byte.
+function git(args, { quiet = false, input, env, raw = false } = {}) {
+  const out = execFileSync('git', args, {
     cwd: ROOT,
     encoding: 'utf8',
     maxBuffer: 512 * 1024 * 1024,
     input,
+    env: env ? { ...process.env, ...env } : undefined,
     stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', quiet ? 'ignore' : 'inherit'],
-  }).replace(/\n$/, '');
+  });
+  return raw ? out : out.replace(/\n$/, '');
 }
 const gitOk = (args) => {
   try {
@@ -54,21 +58,40 @@ const gitOk = (args) => {
   }
 };
 
-async function gh(path, { allow404 = false, ...opts } = {}) {
-  const res = await fetch(`${L.API.github.baseUrl}${path}`, {
-    ...opts,
-    headers: {
-      Authorization: `Bearer ${GITHUB_TOKEN}`,
-      Accept: L.API.github.accept,
-      'X-GitHub-Api-Version': L.API.github.version,
-      ...(opts.body ? { 'Content-Type': 'application/json' } : {}),
-      ...opts.headers,
+async function gh(path, { allow404 = false, method = 'GET', body } = {}) {
+  const res = await L.fetchRetry(
+    fetch,
+    `${L.API.github.baseUrl}${path}`,
+    {
+      method,
+      headers: {
+        Authorization: `Bearer ${GITHUB_TOKEN}`,
+        Accept: L.API.github.accept,
+        'X-GitHub-Api-Version': L.API.github.version,
+        ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
     },
-    signal: AbortSignal.timeout(60_000),
-  });
+    { timeoutMs: 60_000, onRetry: (m) => warn(`GitHub ${method} ${path}: ${m}`) }
+  );
   if (res.status === 404 && allow404) return null;
-  if (!res.ok) throw new Error(`GitHub ${path} -> ${res.status}: ${await res.text()}`);
+  if (!res.ok) {
+    const text = await res.text();
+    throw Object.assign(new Error(`GitHub ${method} ${path} -> ${res.status}: ${text}`), { status: res.status, text });
+  }
   return res.status === 204 ? null : res.json();
+}
+
+// The only two callers are the rolling-branch push and the cursor move.
+function pushWithToken(args) {
+  git(['push', '--quiet', ...args], { env: L.gitAuthEnv(GITHUB_TOKEN) });
+}
+
+// `git ls-tree` entry for one path: { mode, blob } or null.
+function treeEntry(treeish, p) {
+  const line = git(['ls-tree', '-z', treeish, '--', p]).replace(/\0$/, '');
+  const m = line.match(/^(\d+) blob ([0-9a-f]+)\t/);
+  return m ? { mode: m[1], blob: m[2] } : null;
 }
 
 async function ghAll(path) {
@@ -126,7 +149,8 @@ async function main() {
   ]
     .filter(([, v]) => !v)
     .map(([k]) => k);
-  if (!ANTHROPIC_API_KEY && !OPENAI_API_KEY) missing.push('ANTHROPIC_API_KEY or OPENAI_API_KEY');
+  if (!ANTHROPIC_API_KEY) missing.push('ANTHROPIC_API_KEY');
+  if (!OPENAI_API_KEY) missing.push('OPENAI_API_KEY');
   if (missing.length) throw new Error(`Missing required env var(s): ${missing.join(', ')}`);
 
   const models = L.pickModels({ anthropic: ANTHROPIC_API_KEY, openai: OPENAI_API_KEY });
@@ -160,8 +184,17 @@ async function main() {
   }
   const isAncestor = (sha) => gitOk(['rev-parse', '--verify', '--quiet', `${sha}^{commit}`]) && gitOk(['merge-base', '--is-ancestor', sha, 'HEAD']);
   const range = L.selectRange({ since: SINCE, cursor, pushBefore: PUSH_BEFORE, pushForced: PUSH_FORCED }, isAncestor);
+  const pushUrl = `${L.API.github.gitUrl}/${REPO}.git`;
+  // Every run that reaches a decision moves the cursor, so each commit is triaged once.
+  const moveCursor = (why) => {
+    if (TRIAGE_ONLY) return log(`${why}. TRIAGE_ONLY: cursor not moved.`);
+    if (cursor === head) return log(`${why}. Cursor already at ${head.slice(0, 7)}.`);
+    pushWithToken(['--force', pushUrl, `${head}:${L.CURSOR_REF}`]);
+    log(`${why}. Cursor moved to ${head.slice(0, 7)}.`);
+  };
+
   if (range.from === 'HEAD~1' && !gitOk(['rev-parse', '--verify', '--quiet', 'HEAD~1'])) {
-    log('Single-commit history; nothing to compare. (cursor not moved: publishing is phase 4)');
+    moveCursor('Single-commit history; nothing to compare');
     return;
   }
   let from = git(['rev-parse', range.from]);
@@ -175,7 +208,7 @@ async function main() {
   }
   log(`Range ${from.slice(0, 7)}..${head.slice(0, 7)} (${range.source}, ${Math.min(count, cfg.max_commits)} commits)`);
   if (from === head) {
-    log('Empty range; nothing to do. (cursor not moved: publishing is phase 4)');
+    moveCursor('Empty range; nothing to do');
     return;
   }
 
@@ -185,7 +218,7 @@ async function main() {
   log(`Changed files: ${changes.length} (${classified.docs.length} docs, ${classified.code.length} code, ${classified.ignored.length} ignored)`);
   for (const c of changes) log(`  ${c.status} ${c.oldPath ? `${c.oldPath} -> ` : ''}${c.path}`);
   if (classified.skipReason) {
-    log(`Skip: ${classified.skipReason}. (cursor not moved: publishing is phase 4)`);
+    moveCursor(`Skip: ${classified.skipReason}`);
     return;
   }
   const changedPaths = changes.map((c) => c.path);
@@ -219,25 +252,74 @@ async function main() {
   const packed = L.packDiff(patches, cfg.max_diff_tokens);
   log(`Packed diff: ${packed.included.length} files, ~${L.approxTokens(packed.diff)} tokens` + (packed.omitted.length ? `, ${packed.omitted.length} over budget` : ''));
 
-  // 5.12 step 1, read side: carried-forward edits from the rolling branch overlay the checkout
-  const carried = new Map();
+  // 5.12 step 1, read side: carried-forward edits from the rolling branch overlay the checkout.
+  // Edits are carried only while a PR for them is open: after a merge they are in the target, and
+  // after a close a human has said "not now".
+  const owner = REPO.split('/')[0];
+  const findOpenPr = async () =>
+    (await gh(`/repos/${REPO}/pulls?state=open&head=${encodeURIComponent(`${owner}:${cfg.branch}`)}&base=${encodeURIComponent(TARGET_BRANCH)}`))[0] ?? null;
+  const openPr = await findOpenPr();
+  const carried = new Map(); // path -> { mode, blob, content }
   const staleCarried = [];
+  let carryBase = null;
   const remote = `refs/remotes/origin/${cfg.branch}`;
-  if (gitOk(['rev-parse', '--verify', '--quiet', remote])) {
+  // The lease for the force push: what we inspected, or "must not exist".
+  const remoteSha = gitOk(['rev-parse', '--verify', '--quiet', remote]) ? git(['rev-parse', remote]) : '';
+  if (remoteSha) {
     const base = git(['merge-base', 'HEAD', remote]);
     const branchCommits = L.parseGitLog(git(['log', `--format=${L.GIT_LOG_FORMAT}`, `${base}..${remote}`]));
     if (!L.allOwnCommits(branchCommits))
       throw new Error(`origin/${cfg.branch} has commits not authored by the tool; refusing to build on it. Rename or delete that branch.`);
-    const plan = L.planCarryForward({
-      branchFiles: git(['diff', '--name-only', base, remote]).split('\n').filter(Boolean),
-      targetChangedSinceBase: (f) => !gitOk(['diff', '--quiet', base, 'HEAD', '--', f]),
-      isEditableDoc,
-    });
-    for (const f of plan.restore) carried.set(f, git(['show', `${remote}:${f}`]));
-    staleCarried.push(...plan.stale);
-    log(`Carrying forward ${plan.restore.length} unmerged edit(s) from origin/${cfg.branch}` + (plan.stale.length ? `; ${plan.stale.length} stale (target changed): ${plan.stale.join(', ')}` : ''));
+    if (openPr) {
+      carryBase = base;
+      const plan = L.planCarryForward({
+        branchFiles: git(['diff', '--name-only', base, remote]).split('\n').filter(Boolean),
+        targetChangedSinceBase: (f) => !gitOk(['diff', '--quiet', base, 'HEAD', '--', f]),
+        isEditableDoc,
+      });
+      for (const f of plan.restore) carried.set(f, { ...treeEntry(remote, f), content: git(['show', `${remote}:${f}`], { raw: true }) });
+      staleCarried.push(...plan.stale);
+      log(`Open PR #${openPr.number}; carrying forward ${plan.restore.length} unmerged edit(s) from origin/${cfg.branch}` + (plan.stale.length ? `; ${plan.stale.length} stale (target changed): ${plan.stale.join(', ')}` : ''));
+    } else {
+      log(`origin/${cfg.branch} exists with no open PR into ${TARGET_BRANCH}; its edits are not carried forward`);
+    }
   }
-  const readCurrent = (p) => (carried.has(p) ? carried.get(p) : readCheckout(p));
+  const readCurrent = (p) => (carried.has(p) ? carried.get(p).content : readCheckout(p));
+  const prevRuns = L.parseMarker(openPr?.body);
+  // The PR must stop showing a discarded edit even when nothing else changes this run.
+  const mustRefresh = Boolean(openPr && staleCarried.length);
+
+  // Discarded edits go back to triage with the earlier code changes they documented. Where that
+  // range starts comes from the PR marker, so it is only trusted once git confirms the ancestry.
+  let staleText = '';
+  const earlierByPath = new Map();
+  if (staleCarried.length) {
+    const starts = staleCarried.map((p) => {
+      const s = L.regenerateFrom(prevRuns, p, carryBase);
+      return s && isAncestor(s) ? s : carryBase;
+    });
+    const earliest = starts.sort((a, b) => Number(git(['rev-list', '--count', `${b}..HEAD`])) - Number(git(['rev-list', '--count', `${a}..HEAD`])))[0];
+    let earlierDiff = '';
+    let earlierCommits = [];
+    if (earliest !== from && gitOk(['merge-base', '--is-ancestor', earliest, from])) {
+      const older = L.splitUnifiedDiff(git(['diff', '-M', `${earliest}..${from}`])).filter((p) => !isEditableDoc(p.path) && !isIgnored(p.path));
+      const packedOld = L.packDiff(older, cfg.max_stale_diff_tokens);
+      for (const p of older) if (packedOld.included.includes(p.path)) earlierByPath.set(p.path, p);
+      earlierDiff = packedOld.diff;
+      earlierCommits = L.parseGitLog(git(['log', '--reverse', '--no-merges', `--format=${L.GIT_LOG_FORMAT}`, `${earliest}..${from}`]))
+        .filter((c) => !L.isBotEmail(c.email))
+        .slice(-50)
+        .map((c) => ({ short: c.short, subject: c.subject }));
+    }
+    const current = Object.fromEntries(
+      staleCarried.map((p) => {
+        const text = readCurrent(p);
+        return [p, text != null && L.approxTokens(text) <= cfg.max_doc_tokens ? text : null];
+      })
+    );
+    staleText = L.renderStaleBlock({ docs: staleCarried, from: earliest, to: from, commits: earlierCommits, diff: earlierDiff, current });
+    log(`Stale edit(s) sent back to triage: ${staleCarried.join(', ')}` + (earlierDiff ? ` (earlier changes ${earliest.slice(0, 7)}..${from.slice(0, 7)}, ${earlierByPath.size} file(s))` : ''));
+  }
 
   // 5.6 manifest
   const docPaths = [...new Set([...walkDocs(isEditableDoc), ...carried.keys()])];
@@ -253,7 +335,7 @@ async function main() {
   const callModel = async (spec, label, { system, blocks, maxTokens, stream = false }) => {
     const apiKey = spec.provider === 'anthropic' ? ANTHROPIC_API_KEY : OPENAI_API_KEY;
     const fn = spec.provider === 'anthropic' ? L.anthropicCall : L.openaiCall;
-    const r = await fn({ fetch, apiKey, model: spec.model, system, blocks, maxTokens, effort: spec.effort, stream });
+    const r = await fn({ fetch, apiKey, model: spec.model, system, blocks, maxTokens, effort: spec.effort, stream, retry: { onRetry: (m) => warn(`${label}: ${m}`) } });
     usage.log(label, spec.model, r.usage);
     debug(`${label} raw output`, r.text);
     if (/max_tokens|length/.test(String(r.stopReason))) warn(`${label}: output cut off by the token budget (stop_reason=${r.stopReason})`);
@@ -261,7 +343,7 @@ async function main() {
   };
 
   // 5.7 triage
-  const prefix = L.writerPrefix({ guidelines: guidelines.text, narrative, diff: packed.diff, manifest: manifestText });
+  const prefix = L.writerPrefix({ guidelines: guidelines.text, narrative, diff: packed.diff, manifest: manifestText, stale: staleText });
   const triageRaw = await callModel(models.triage, 'triage', { system: L.TRIAGE_SYSTEM, blocks: [{ text: prefix }], maxTokens: cfg.response_max_tokens });
   const triage = L.parseTriage(triageRaw.text, { isEditableDocPath, exists: (p) => readCurrent(p) != null, maxDocs: cfg.max_docs_per_run });
   if (!triage) throw new Error('triage returned unparseable output (run with DEBUG=1 to see it)');
@@ -275,8 +357,9 @@ async function main() {
     log(`TRIAGE_ONLY set; stopping. ${costLine(usage)}`);
     return;
   }
-  if (!triage.affected.length) {
-    log(`No docs affected; nothing to write. (cursor not moved: publishing is phase 4) ${costLine(usage)}`);
+  if (!triage.affected.length && !mustRefresh) {
+    log(costLine(usage));
+    moveCursor('No docs affected; nothing to write');
     return;
   }
 
@@ -296,7 +379,7 @@ async function main() {
       path: a.path,
       action: a.action,
       reason: a.reason,
-      sourcePatches: a.source_files.map((f) => patchByPath.get(f)?.patch).filter(Boolean).join('\n\n'),
+      sourcePatches: a.source_files.flatMap((f) => [earlierByPath.get(f)?.patch, patchByPath.get(f)?.patch]).filter(Boolean).join('\n\n'),
       current: readCurrent(a.path) ?? '',
     });
   const writeDoc = async (a, extra = '') => {
@@ -329,6 +412,7 @@ async function main() {
             text: L.checkerUser({
               narrative,
               diff: packed.diff,
+              stale: staleText,
               docs: drafts.map((d) => ({ ...d, editDiff: L.unifiedDiff(d.current ?? '', d.content, d.path) })),
             }),
           },
@@ -389,24 +473,128 @@ async function main() {
   }
   for (const d of dropped) log(`DROP ${d.path} -- gate ${d.gate}: ${d.reason}`);
   for (const h of heldBack) log(`HELD ${h.path} -- ${h.reason}`);
-  for (const s of staleCarried) log(`STALE carried edit dropped, target changed ${s}; re-run with since= to regenerate`);
+  for (const s of staleCarried)
+    log(`STALE carried edit discarded, target changed ${s}; ` + (kept.some((k) => k.path === s) ? 'redone this run' : `not reselected (force with since=${L.regenerateFrom(prevRuns, s, carryBase)})`));
   for (const a of triage.overflow) log(`ALSO likely affected, not edited this run: ${a.path}`);
   for (const d of triage.deleteCandidates) log(`DELETE candidate (never acted on): ${d.path} -- ${d.reason}`);
   if (carried.size) log(`CARRIED forward from earlier runs: ${[...carried.keys()].join(', ')}`);
   if (packed.omitted.length) log(`DIFF over budget, not shown to the models: ${packed.omitted.join(', ')}`);
   log(costLine(usage));
 
-  if (DRY_RUN) {
-    log('\n===== DRY RUN -- diffs that would be pushed =====');
-    for (const k of kept) log(`\n${L.unifiedDiff(k.current ?? '', k.content, k.path) || `(no textual diff for ${k.path})`}`);
-  }
-
-  if (!kept.length) {
-    log('Nothing survived the gates. (cursor not moved: publishing is phase 4)');
+  if (!kept.length && !mustRefresh) {
+    moveCursor('Nothing survived the gates; the rolling PR is left as it is');
     return;
   }
-  log(`\n${kept.length} file(s) ready. Publishing (branch rebuild, push, PR, cursor) is not implemented yet: phase 4.` + (RUN_URL ? ` Run: ${RUN_URL}` : ''));
-  if (!DRY_RUN) process.exitCode = 1;
+
+  // ------------------------------------------------------------- publish ---
+
+  const scope = L.commitScope(cfg.branch);
+  const keptPaths = new Set(kept.map((k) => k.path));
+  const carriedOnly = [...carried.keys()].filter((p) => !keptPaths.has(p));
+  const title = L.prTitle({ scope, target: TARGET_BRANCH, to: head });
+  const prBody = L.renderPrBody({
+    target: TARGET_BRANCH,
+    from,
+    to: head,
+    commitCount: Math.min(count, cfg.max_commits),
+    capped,
+    runUrl: RUN_URL,
+    kept,
+    carried: carriedOnly.map((p) => ({ path: p, run: L.lastRunFor(prevRuns, p) })),
+    stale: staleCarried.map((p) => ({ path: p, since: L.regenerateFrom(prevRuns, p, carryBase), redone: keptPaths.has(p) })),
+    dropped,
+    heldBack,
+    deleteCandidates: triage.deleteCandidates,
+    overflow: triage.overflow,
+    omittedDiff: packed.omitted,
+    outline: L.narrativeOutline({ commits, linked, prs }),
+    usage: { entries: usage.entries, total: usage.total(), unpriced: usage.unpriced() },
+    runs: [...prevRuns, { at: new Date().toISOString(), from, to: head, files: [...keptPaths] }],
+  });
+
+  if (DRY_RUN) {
+    log(`\n===== DRY RUN -- would push ${cfg.branch} and ${openPr ? `update PR #${openPr.number}` : 'open a PR'} =====`);
+    log(`Files: ${[...keptPaths].join(', ')}` + (carriedOnly.length ? `; carried: ${carriedOnly.join(', ')}` : ''));
+    for (const k of kept) log(`\n${L.unifiedDiff(k.current ?? '', k.content, k.path) || `(no textual diff for ${k.path})`}`);
+    log(`\n----- PR title -----\n${title}\n----- PR body -----\n${prBody}`);
+    moveCursor('Dry run');
+    return;
+  }
+
+  // Built with plumbing in a throwaway index: the working tree never changes and no file is
+  // written through a path on disk.
+  const tmp = mkdtempSync(join(tmpdir(), 'ai-docs-sync-'));
+  let tree;
+  try {
+    const env = { GIT_INDEX_FILE: join(tmp, 'index') };
+    const stage = (mode, blob, p) => {
+      if (!/^1006[04][04]$/.test(mode)) throw new Error(`refusing to stage ${p}: tree mode ${mode} is not a regular file`);
+      git(['update-index', '--add', '--cacheinfo', `${mode},${blob},${p}`], { env });
+    };
+    git(['read-tree', head], { env });
+    for (const p of carriedOnly) stage(carried.get(p).mode, carried.get(p).blob, p);
+    for (const k of kept) stage(treeEntry(head, k.path)?.mode ?? '100644', git(['hash-object', '-w', '--stdin'], { input: k.content }), k.path);
+    tree = git(['write-tree'], { env });
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+  // With an open PR the push still happens, so the PR stops showing edits that were dropped.
+  if (tree === git(['rev-parse', `${head}^{tree}`]) && !openPr) {
+    moveCursor('The edits reproduce the target tree exactly; nothing to publish');
+    return;
+  }
+  const commit = git(['commit-tree', '--no-gpg-sign', tree, '-p', head, '-F', '-'], {
+    input: L.commitMessage({ scope, from, to: head, target: TARGET_BRANCH, files: [...keptPaths], carried: carriedOnly, runUrl: RUN_URL }),
+    env: { GIT_AUTHOR_NAME: L.BOT_NAME, GIT_AUTHOR_EMAIL: L.BOT_EMAIL, GIT_COMMITTER_NAME: L.BOT_NAME, GIT_COMMITTER_EMAIL: L.BOT_EMAIL },
+  });
+  // The lease pins the push to the branch state the ownership check inspected.
+  pushWithToken([`--force-with-lease=refs/heads/${cfg.branch}:${remoteSha}`, pushUrl, `${commit}:refs/heads/${cfg.branch}`]);
+  log(`Pushed ${cfg.branch} at ${commit.slice(0, 7)}`);
+
+  let pr = openPr;
+  if (pr) {
+    await gh(`/repos/${REPO}/pulls/${pr.number}`, { method: 'PATCH', body: { title, body: prBody } });
+    log(`Updated PR #${pr.number}: ${pr.html_url}`);
+  } else {
+    try {
+      pr = await gh(`/repos/${REPO}/pulls`, { method: 'POST', body: { title, head: cfg.branch, base: TARGET_BRANCH, body: prBody } });
+      log(`Opened PR #${pr.number}: ${pr.html_url}`);
+    } catch (e) {
+      if (e.status === 403)
+        throw new Error(
+          `Creating the PR was refused (403). Enable "Allow GitHub Actions to create and approve pull requests" ` +
+            `(Settings -> Actions -> General -> Workflow permissions) or set DOCS_SYNC_TOKEN. ${cfg.branch} was pushed; ` +
+            `the next run rebuilds it. GitHub said: ${e.text}`
+        );
+      // A create retried after a 5xx can find its own first attempt.
+      if (e.status !== 422 || !(pr = await findOpenPr())) throw e;
+      await gh(`/repos/${REPO}/pulls/${pr.number}`, { method: 'PATCH', body: { title, body: prBody } });
+      log(`Updated PR #${pr.number}: ${pr.html_url}`);
+    }
+  }
+  if (cfg.label) {
+    try {
+      await gh(`/repos/${REPO}/issues/${pr.number}/labels`, { method: 'POST', body: { labels: [cfg.label] } });
+    } catch (e) {
+      warn(`could not add label "${cfg.label}" (${e.status ?? e.message}); continuing`);
+    }
+  }
+
+  moveCursor('Published');
+
+  try {
+    await gh(`/repos/${REPO}/statuses/${commit}`, {
+      method: 'POST',
+      body: {
+        state: 'success',
+        context: L.STATUS_CONTEXT,
+        description: `${kept.length} edited, ${dropped.length + heldBack.length} held back`,
+        ...(RUN_URL ? { target_url: RUN_URL } : {}),
+      },
+    });
+  } catch (e) {
+    warn(`could not post the ${L.STATUS_CONTEXT} status (${e.status ?? e.message})`);
+  }
 }
 
 const costLine = (usage) =>
