@@ -41,7 +41,8 @@ const debug = (label, text) => {
 
 // `raw` keeps the trailing newline: file contents must round-trip byte for byte.
 function git(args, { quiet = false, input, env, raw = false } = {}) {
-  const out = execFileSync('git', args, {
+  // Unquoted paths, so non-ASCII names match the -z output they are compared with.
+  const out = execFileSync('git', ['-c', 'core.quotePath=false', ...args], {
     cwd: ROOT,
     encoding: 'utf8',
     maxBuffer: 512 * 1024 * 1024,
@@ -295,7 +296,7 @@ async function main() {
     if (openPr) {
       carryBase = base;
       const plan = L.planCarryForward({
-        branchFiles: git(['diff', '--name-only', base, remote]).split('\n').filter(Boolean),
+        branchFiles: git(['diff', '--name-only', '-z', base, remote]).split('\0').filter(Boolean),
         targetChangedSinceBase: (f) => !gitOk(['diff', '--quiet', base, 'HEAD', '--', f]),
         isEditableDoc,
       });
