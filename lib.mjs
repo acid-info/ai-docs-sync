@@ -123,8 +123,8 @@ export const MARKER_RUNS = 20;
 
 // -------------------------------------------------------------------- config ---
 
-// Minimal YAML subset: `key: value`, `key:` followed by `- item` lines, `#` comments. Enough for
-// the documented config and nothing more, so the tool stays dependency-free.
+// Minimal YAML subset: `key: value`, `key: [a, b]`, `key:` followed by `- item` lines, `#`
+// comments. Enough for the documented config and nothing more, so the tool stays dependency-free.
 export function parseYamlSubset(text) {
   const out = {};
   let currentList = null;
@@ -140,9 +140,13 @@ export function parseYamlSubset(text) {
     const kv = line.match(/^([\w_]+):\s*(.*)$/);
     if (!kv) continue;
     const [, key, val] = kv;
+    const flow = val.match(/^\[(.*)\]$/);
     if (val === '') {
       out[key] = [];
       currentList = key;
+    } else if (flow) {
+      out[key] = flow[1].split(',').map(unquote).filter(Boolean);
+      currentList = null;
     } else {
       const scalar = unquote(val);
       out[key] = /^\d+$/.test(scalar) ? Number(scalar) : scalar;

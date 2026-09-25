@@ -125,6 +125,15 @@ describe('config', () => {
     assert.deepEqual(parsed.extra_ignore, ['flake.lock', 'apps/cms/src/app/(payload)/admin/importMap.js']);
   });
 
+  test('inline flow lists parse like block lists', () => {
+    const parsed = parseYamlSubset(`doc_paths: [docs/**/*.md, 'README.md', "apps/*/README.md"]  # inline\nnever_touch: []\n`);
+    assert.deepEqual(parsed.doc_paths, ['docs/**/*.md', 'README.md', 'apps/*/README.md']);
+    assert.deepEqual(parsed.never_touch, []);
+    const isDoc = makeIsEditableDocPath(loadConfig('doc_paths: [docs/**/*.md, README.md]\n'));
+    assert.ok(isDoc('docs/a/b.md'));
+    assert.ok(isDoc('README.md'));
+  });
+
   test('applies defaults and appends extra_ignore to the built-in list', () => {
     const c = cfg();
     assert.equal(c.branch, 'docs/repo/sync');

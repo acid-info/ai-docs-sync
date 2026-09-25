@@ -130,7 +130,7 @@ key.
 
 | Key | Effect |
 | --- | --- |
-| `doc_paths` | Globs the tool may create or edit. Markdown only; anything else is refused in code. |
+| `doc_paths` | Globs the tool may create or edit. Markdown only; anything else is refused in code. A list may be written as `- item` lines or inline as `[a, b]`. |
 | `never_touch` | Subtracted from `doc_paths`. Everything under `.github/` is subtracted whether or not it is listed. |
 | `extra_ignore` | Diff-side ignores, appended to the built-in list. Same semantics as ai-review. |
 | `guidelines_files` | Priority list; the first that exists is loaded. `AGENTS.md` is special-cased as in ai-review. |
