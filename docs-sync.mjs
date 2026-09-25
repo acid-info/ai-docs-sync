@@ -1,10 +1,5 @@
 #!/usr/bin/env node
-// Entry point: env parsing and stage orchestration. Everything pure lives in lib.mjs; this is the
-// only file that reads process.env, runs git or touches the network.
-//
-// Env: GITHUB_TOKEN, REPO ("owner/name"), TARGET_BRANCH, ANTHROPIC_API_KEY, OPENAI_API_KEY.
-// Optional: PUSH_BEFORE, PUSH_FORCED, SINCE, DRY_RUN, TRIAGE_ONLY, DEBUG, RUN_URL.
-// Runs from the target-branch checkout with full history (fetch-depth: 0).
+// The only file that reads process.env, runs git or touches the network; the rest is in lib.mjs.
 
 import { execFileSync, execSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync, lstatSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -273,9 +268,8 @@ async function main() {
   const packed = L.packDiff(patches, cfg.max_diff_tokens);
   log(`Packed diff: ${packed.included.length} files, ~${L.approxTokens(packed.diff)} tokens` + (packed.omitted.length ? `, ${packed.omitted.length} over budget` : ''));
 
-  // 5.12 step 1, read side: carried-forward edits from the rolling branch overlay the checkout.
-  // Edits are carried only while a PR for them is open: after a merge they are in the target, and
-  // after a close a human has said "not now".
+  // 5.12 step 1: rolling-branch edits overlay the checkout only while their PR is open; merged
+  // means they are in the target, closed means "not now".
   const owner = REPO.split('/')[0];
   const findOpenPr = async () =>
     (await gh(`/repos/${REPO}/pulls?state=open&head=${encodeURIComponent(`${owner}:${cfg.branch}`)}&base=${encodeURIComponent(TARGET_BRANCH)}`))[0] ?? null;

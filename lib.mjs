@@ -328,10 +328,8 @@ const normalisePr = (pr) => ({
   user: pr.user?.login ?? '',
 });
 
-// Links commits to PRs: subjects first (free), then `commits/{sha}/pulls` for the rest, marking
-// every commit of a found PR as linked so one PR costs one lookup. `api` is injected:
-// { pr(n), pullsForCommit(sha), prCommits(n) }; prCommits returns { sha, subject, email } per
-// commit. A rebase merge rewrites SHAs, so a PR commit also matches by subject + author email.
+// One lookup covers every commit of a found PR, matched by SHA or, since a rebase merge rewrites
+// SHAs, by subject + author email.
 export async function collectPrs(commits, api, { targetBranch, rollingBranch, maxLookups = DEFAULTS.max_pr_lookups }) {
   const linked = new Map(); // sha -> pr number
   const prs = new Map(); // number -> normalised pr
