@@ -36,7 +36,10 @@ swapping a model is one edit here, not one per consumer.
 
 Retries: every GitHub and model call has a timeout and is retried once, with backoff, on a
 5xx, a 429 or Anthropic's 529. A second failure fails the run, and the cursor stays put so the
-next push picks the range up again.
+next push picks the range up again. The exceptions are the checker, whose failure leaves the
+edits unchecked, and the writer: a failed call holds back only that doc, unless no writer call
+succeeded and at least one failure was an outage (a 5xx, 429, 529 or network error) rather than
+something about the request (a 400, a timeout).
 
 The tool has **zero npm dependencies** and runs on Node 22's global `fetch`. Keep it that way:
 no build step, no `package.json`.

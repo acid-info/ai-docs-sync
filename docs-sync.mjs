@@ -410,22 +410,33 @@ async function main() {
       sourcePatches: a.source_files.flatMap((f) => [earlierByPath.get(f)?.patch, patchByPath.get(f)?.patch]).filter(Boolean).join('\n\n'),
       current: readCurrent(a.path) ?? '',
     });
+  // { content } with content null when unparseable, or { error } once the call's retries are spent.
   const writeDoc = async (a, extra = '') => {
-    const r = await callModel(models.writer, `writer ${a.path}`, {
-      system: L.WRITER_SYSTEM,
-      blocks: [{ text: prefix, cache: true }, { text: docPart(a) + extra }],
-      maxTokens: cfg.writer_max_tokens,
-      stream: models.writer.provider === 'anthropic',
-    });
-    return L.parseWriterOutput(r.text);
+    try {
+      const r = await callModel(models.writer, `writer ${a.path}`, {
+        system: L.WRITER_SYSTEM,
+        blocks: [{ text: prefix, cache: true }, { text: docPart(a) + extra }],
+        maxTokens: cfg.writer_max_tokens,
+        stream: models.writer.provider === 'anthropic',
+      });
+      return { content: L.parseWriterOutput(r.text) };
+    } catch (error) {
+      warn(`writer ${a.path} failed (${error.message})`);
+      return { error };
+    }
   };
   // The first call alone warms the cached prefix; the rest run three at a time against it.
   const drafts = [];
   const written = writable.length ? [await writeDoc(writable[0])] : [];
   written.push(...(await L.mapConcurrent(writable.slice(1), cfg.writer_concurrency, (a) => writeDoc(a))));
+  // Nothing written and an outage among the causes: fail so the cursor stays put and a later run
+  // retries. A request-specific failure (a 400, a timeout) would fail every run, so it is held back.
+  if (written.length && written.every((w) => w.error) && written.some((w) => L.isTransientError(w.error)))
+    throw written.find((w) => L.isTransientError(w.error)).error;
   writable.forEach((a, i) => {
-    if (written[i] == null) heldBack.push({ path: a.path, reason: 'writer output could not be parsed as a fenced file' });
-    else drafts.push({ ...a, content: written[i], current: readCurrent(a.path) });
+    if (written[i].error) heldBack.push({ path: a.path, reason: `writer call failed: ${written[i].error.message}` });
+    else if (written[i].content == null) heldBack.push({ path: a.path, reason: 'writer output could not be parsed as a fenced file' });
+    else drafts.push({ ...a, content: written[i].content, current: readCurrent(a.path) });
   });
   log(`Writer: ${drafts.length} draft(s)` + (heldBack.length ? `, ${heldBack.length} held back` : ''));
 
@@ -466,8 +477,9 @@ async function main() {
     log(`Correction pass for ${toCorrect.length} file(s)`);
     const corrected = await L.mapConcurrent(toCorrect, cfg.writer_concurrency, (d) => writeDoc(d, '\n\n' + L.correctionPart({ draft: d.content, issues: d.check.issues })));
     toCorrect.forEach((d, i) => {
-      if (corrected[i] == null) warn(`correction for ${d.path} unparseable; keeping the first draft`);
-      candidates.push({ ...d, content: corrected[i] ?? d.content, corrected: corrected[i] != null });
+      const content = corrected[i].content;
+      if (content == null) warn(`correction for ${d.path} ${corrected[i].error ? 'failed' : 'unparseable'}; keeping the first draft`);
+      candidates.push({ ...d, content: content ?? d.content, corrected: content != null });
     });
   }
 

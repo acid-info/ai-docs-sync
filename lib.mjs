@@ -1073,6 +1073,11 @@ export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // 529 is Anthropic's "overloaded".
 export const isRetryableStatus = (status) => status === 429 || status === 529 || (status >= 500 && status <= 599);
 
+// An outage rather than something about the request: a retryable status or a network error. A
+// timeout is not, since a long doc times out every time.
+export const isTransientError = (e) =>
+  e?.status == null ? e?.name !== 'TimeoutError' && e?.name !== 'AbortError' : isRetryableStatus(e.status);
+
 // One retry on 5xx/429/529 or a network error, honouring Retry-After up to `maxDelayMs`. Each
 // attempt gets its own timeout. A timeout is not retried: it already spent the whole budget.
 export async function fetchRetry(f, url, init, { timeoutMs, retries = 1, baseDelayMs = 3000, maxDelayMs = 30_000, sleep: wait = sleep, onRetry = () => {} } = {}) {
@@ -1117,7 +1122,7 @@ export async function anthropicCall({ fetch: f, apiKey, model, system, blocks, m
     },
     { timeoutMs, ...retry }
   );
-  if (!res.ok) throw new Error(`Anthropic ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw Object.assign(new Error(`Anthropic ${res.status}: ${await res.text()}`), { status: res.status });
   const usage = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
   const readUsage = (u) => {
     if (!u) return;
@@ -1145,7 +1150,7 @@ export async function anthropicCall({ fetch: f, apiKey, model, system, blocks, m
     else if (ev.type === 'message_delta') {
       readUsage(ev.usage);
       if (ev.delta?.stop_reason) stopReason = ev.delta.stop_reason;
-    } else if (ev.type === 'error') throw new Error(`Anthropic stream error: ${JSON.stringify(ev.error ?? ev)}`);
+    } else if (ev.type === 'error') throw Object.assign(new Error(`Anthropic stream error: ${JSON.stringify(ev.error ?? ev)}`), { status: 500 });
   }
   return { text, usage, stopReason, truncated: stopReason === 'max_tokens' };
 }
@@ -1169,7 +1174,7 @@ export async function openaiCall({ fetch: f, apiKey, model, system, blocks, maxT
     },
     { timeoutMs, ...retry }
   );
-  if (!res.ok) throw new Error(`OpenAI ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw Object.assign(new Error(`OpenAI ${res.status}: ${await res.text()}`), { status: res.status });
   const data = await res.json();
   const text =
     (data.output ?? [])

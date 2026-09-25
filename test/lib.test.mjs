@@ -62,6 +62,7 @@ import {
   BOT_EMAIL,
   fetchRetry,
   isRetryableStatus,
+  isTransientError,
   costOf,
   narrativeOutline,
   defuseRefs,
@@ -642,6 +643,18 @@ describe('model calls over fetch', () => {
     assert.deepEqual(r.usage, { input: 30, cacheRead: 20, cacheWrite: 0, output: 5 });
     assert.equal(sent.input[1].content, 'a\n\nb');
     assert.deepEqual(sent.reasoning, { effort: 'low' });
+  });
+
+  test('failures carry their status; outages are transient, request problems and timeouts are not', async () => {
+    const bad = (status) => async () => ({ ok: false, status, text: async () => 'x' });
+    const err = (p) => p.then(() => null, (e) => e);
+    const a400 = await err(anthropicCall({ fetch: bad(400), apiKey: 'k', model: 'claude-sonnet-5', system: 'S', blocks: [{ text: 'x' }], maxTokens: 1 }));
+    const o529 = await err(openaiCall({ fetch: bad(529), apiKey: 'k', model: 'gpt-6-luna', system: 'S', blocks: [{ text: 'x' }], maxTokens: 1, retry: { retries: 0 } }));
+    assert.equal(a400.status, 400);
+    assert.equal(isTransientError(a400), false);
+    assert.equal(isTransientError(o529), true);
+    assert.equal(isTransientError(new TypeError('fetch failed')), true);
+    assert.equal(isTransientError(Object.assign(new Error('t'), { name: 'TimeoutError' })), false);
   });
 
   test('both providers report truncation by the output budget', async () => {
