@@ -7,9 +7,9 @@
 // Runs from the target-branch checkout with full history (fetch-depth: 0).
 
 import { execFileSync, execSync } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync, lstatSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, lstatSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import * as L from './lib.mjs';
 
 const {
@@ -23,6 +23,8 @@ const {
   SINCE,
   RUN_URL,
 } = process.env;
+// Children (setup_command, prettier, git) inherit process.env; only the push gets a token back.
+for (const k of ['GITHUB_TOKEN', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY']) delete process.env[k];
 const truthy = (v) => /^(1|true|yes)$/i.test(v ?? '');
 const DRY_RUN = truthy(process.env.DRY_RUN);
 const TRIAGE_ONLY = truthy(process.env.TRIAGE_ONLY);
@@ -82,9 +84,22 @@ async function gh(path, { allow404 = false, method = 'GET', body } = {}) {
   return res.status === 204 ? null : res.json();
 }
 
-// The only two callers are the rolling-branch push and the cursor move.
+// Pushes from a throwaway repo that borrows the checkout's objects: setup_command can write hooks
+// and config into .git, and none of it may run next to the token.
 function pushWithToken(args) {
-  git(['push', '--quiet', ...args], { env: L.gitAuthEnv(GITHUB_TOKEN) });
+  const objects = resolve(ROOT, git(['rev-parse', '--git-path', 'objects']));
+  const dir = mkdtempSync(join(tmpdir(), 'ai-docs-sync-push-'));
+  try {
+    mkdirSync(join(dir, 'objects', 'info'), { recursive: true });
+    mkdirSync(join(dir, 'refs'));
+    writeFileSync(join(dir, 'objects', 'info', 'alternates'), `${objects}\n`);
+    writeFileSync(join(dir, 'HEAD'), 'ref: refs/heads/main\n');
+    writeFileSync(join(dir, 'config'), '[core]\n\trepositoryformatversion = 0\n\tbare = true\n');
+    const env = { GIT_DIR: dir, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', ...L.gitAuthEnv(GITHUB_TOKEN) };
+    git(['push', '--quiet', ...args], { env });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 // `git ls-tree` entry for one path: { mode, blob } or null.
@@ -123,7 +138,7 @@ function walkDocs(isEditableDoc, dir = '') {
 function makeFormatter(cfg) {
   if (cfg.format_check !== 'strict') return { mode: 'off' };
   log(`Running setup_command for format_check: strict`);
-  execSync(cfg.setup_command, { cwd: ROOT, stdio: 'inherit', env: { ...process.env, GITHUB_TOKEN: '', ANTHROPIC_API_KEY: '', OPENAI_API_KEY: '' } });
+  execSync(cfg.setup_command, { cwd: ROOT, stdio: 'inherit' });
   const prettier = join(ROOT, 'node_modules', '.bin', 'prettier');
   if (!existsSync(prettier)) throw new Error('format_check: strict but node_modules/.bin/prettier is missing after setup_command');
   return {

@@ -313,9 +313,13 @@ dispatched directly. End-to-end changes have to be proved on a real push in a co
   drives control flow; the rolling PR is located by head and base, not by marker.
 - The force-push target is validated (not the target or default branch, safe charset) and the
   existing branch must consist solely of the tool's own commits.
-- No write credential is persisted in the checkout. `setup_command` and prettier run in a tree
-  whose `.git/config` holds no token; only the push and cursor-update child processes receive
-  it, via environment.
+- No write credential is persisted in the checkout. The token and API keys are removed from the
+  tool's environment at startup, so they are not passed to `setup_command`, prettier or git.
+  Only the push and cursor-update child processes receive the token, via environment, and they
+  run from a throwaway git dir that borrows the checkout's objects, so no hook or config written
+  into `.git` runs next to the token. This does not sandbox `setup_command`: on a hosted runner
+  its code runs as the same user as the tool, with passwordless sudo. A repo that does not trust
+  its install scripts keeps `format_check: off`.
 - `permissions:` is bounded by the consumer's workflow file. Never `secrets: inherit`.
 - Nothing from the event payload is interpolated into shell text; the resolve step reads it from
   `env`.
