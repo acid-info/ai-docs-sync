@@ -117,16 +117,16 @@ async function ghAll(path) {
 
 const readCheckout = (p) => (existsSync(join(ROOT, p)) ? readFileSync(join(ROOT, p), 'utf8') : null);
 
-// Walks the checkout for editable docs; symlinked directories are never entered.
-function walkDocs(isEditableDoc, dir = '') {
+// Walks the checkout for files matching `pred`; symlinked directories are never entered.
+function walkDocs(pred, dir = '') {
   const out = [];
   for (const name of readdirSync(join(ROOT, dir))) {
     if (name === '.git' || name === 'node_modules') continue;
     const rel = dir ? `${dir}/${name}` : name;
     const st = lstatSync(join(ROOT, rel));
     if (st.isSymbolicLink()) continue;
-    if (st.isDirectory()) out.push(...walkDocs(isEditableDoc, rel));
-    else if (st.isFile() && isEditableDoc(rel)) out.push(rel);
+    if (st.isDirectory()) out.push(...walkDocs(pred, rel));
+    else if (st.isFile() && pred(rel)) out.push(rel);
   }
   return out;
 }
@@ -275,7 +275,9 @@ async function main() {
     (await gh(`/repos/${REPO}/pulls?state=open&head=${encodeURIComponent(`${owner}:${cfg.branch}`)}&base=${encodeURIComponent(TARGET_BRANCH)}`))[0] ?? null;
   const openPr = await findOpenPr();
   const carried = new Map(); // path -> { mode, blob, content }
-  const staleCarried = [];
+  const tombstones = new Set(); // docs the rolling branch deletes
+  const staleCarried = []; // { path, kind }
+  const obsolete = [];
   let carryBase = null;
   const remote = `refs/remotes/origin/${cfg.branch}`;
   // The lease for the force push: what we inspected, or "must not exist".
@@ -284,39 +286,51 @@ async function main() {
     const base = git(['merge-base', 'HEAD', remote]);
     const branchCommits = L.parseGitLog(git(['log', `--format=${L.GIT_LOG_FORMAT}`, `${base}..${remote}`]));
     const foreign = L.foreignBranchCommit(branchCommits, {
-      changesOf: (sha) => L.parseNameStatus(git(['diff-tree', '--no-commit-id', '--name-status', '-r', '-z', '-M', sha])),
+      changesOf: (sha) => L.parseNameStatus(git(['diff-tree', '--no-commit-id', '--name-status', '-r', '-z', '--no-renames', sha])),
       isEditableDoc,
     });
     if (foreign)
       throw new Error(
-        `origin/${cfg.branch} has ${foreign.short} "${foreign.subject}" (${foreign.email}), which is neither the tool's nor a doc addition or edit; ` +
+        `origin/${cfg.branch} has ${foreign.short} "${foreign.subject}" (${foreign.email}), which is neither the tool's nor a doc addition, edit or delete; ` +
           `refusing to build on it. Rename or delete that branch.`
       );
     if (openPr) {
       carryBase = base;
       const plan = L.planCarryForward({
-        branchFiles: git(['diff', '--name-only', '-z', base, remote]).split('\0').filter(Boolean),
+        branchChanges: L.parseNameStatus(git(['diff', '--name-status', '-z', '--no-renames', base, remote])),
+        targetHas: (f) => treeEntry(head, f) != null,
         targetChangedSinceBase: (f) => !gitOk(['diff', '--quiet', base, 'HEAD', '--', f]),
         isEditableDoc,
       });
       for (const f of plan.restore) carried.set(f, { ...treeEntry(remote, f), content: git(['show', `${remote}:${f}`], { raw: true }) });
+      for (const f of plan.restoreDeletes) tombstones.add(f);
       staleCarried.push(...plan.stale);
-      log(`Open PR #${openPr.number}; carrying forward ${plan.restore.length} unmerged edit(s) from origin/${cfg.branch}` + (plan.stale.length ? `; ${plan.stale.length} stale (target changed): ${plan.stale.join(', ')}` : ''));
+      obsolete.push(...plan.obsolete);
+      log(
+        `Open PR #${openPr.number}; carrying forward ${plan.restore.length} unmerged edit(s) and ${plan.restoreDeletes.length} delete(s) from origin/${cfg.branch}` +
+          (plan.stale.length ? `; ${plan.stale.length} stale (target changed): ${plan.stale.map((x) => `${x.path} (${x.kind})`).join(', ')}` : '') +
+          (plan.obsolete.length ? `; ${plan.obsolete.length} obsolete (target deleted the file): ${plan.obsolete.join(', ')}` : '')
+      );
     } else {
       log(`origin/${cfg.branch} exists with no open PR into ${TARGET_BRANCH}; its edits are not carried forward`);
     }
   }
-  const readCurrent = (p) => (carried.has(p) ? carried.get(p).content : readCheckout(p));
+  // A tombstone triage names again reads as the target's copy, but stays deleted unless kept.
+  const undeleted = new Set();
+  const isTombstone = (p) => tombstones.has(p) && !undeleted.has(p);
+  const readCurrent = (p) => (carried.has(p) ? carried.get(p).content : isTombstone(p) ? null : readCheckout(p));
   const prevRuns = L.parseMarker(openPr?.body);
-  // The PR must stop showing a discarded edit even when nothing else changes this run.
-  const mustRefresh = Boolean(openPr && staleCarried.length);
+  // The PR must stop showing a discarded or obsolete change even when nothing else changes.
+  const mustRefresh = Boolean(openPr && (staleCarried.length || obsolete.length));
+  const stalePaths = staleCarried.map((x) => x.path);
 
   // Discarded edits go back to triage with the earlier code changes they documented. Where that
   // range starts comes from the PR marker, so it is only trusted once git confirms the ancestry.
   let staleText = '';
   const earlierByPath = new Map();
+  const earlierPaths = new Set();
   if (staleCarried.length) {
-    const starts = staleCarried.map((p) => {
+    const starts = stalePaths.map((p) => {
       const s = L.regenerateFrom(prevRuns, p, carryBase);
       return s && isAncestor(s) ? s : carryBase;
     });
@@ -327,6 +341,7 @@ async function main() {
       const older = L.splitUnifiedDiff(git(['diff', '-M', `${earliest}..${from}`])).filter((p) => !isEditableDoc(p.path) && !isIgnored(p.path));
       const packedOld = L.packDiff(older, cfg.max_stale_diff_tokens);
       for (const p of older) if (packedOld.included.includes(p.path)) earlierByPath.set(p.path, p);
+      for (const p of older) for (const q of [p.path, p.oldPath]) if (q) earlierPaths.add(q);
       earlierDiff = packedOld.diff;
       earlierCommits = L.parseGitLog(git(['log', '--reverse', '--no-merges', `--format=${L.GIT_LOG_FORMAT}`, `${earliest}..${from}`]))
         .filter((c) => !L.isBotEmail(c.email))
@@ -334,17 +349,19 @@ async function main() {
         .map((c) => ({ short: c.short, subject: c.subject }));
     }
     const current = Object.fromEntries(
-      staleCarried.map((p) => {
+      stalePaths.map((p) => {
         const text = readCurrent(p);
         return [p, text != null && L.approxTokens(text) <= cfg.max_doc_tokens ? text : null];
       })
     );
     staleText = L.renderStaleBlock({ docs: staleCarried, from: earliest, to: from, commits: earlierCommits, diff: earlierDiff, current });
-    log(`Stale edit(s) sent back to triage: ${staleCarried.join(', ')}` + (earlierDiff ? ` (earlier changes ${earliest.slice(0, 7)}..${from.slice(0, 7)}, ${earlierByPath.size} file(s))` : ''));
+    log(`Stale change(s) sent back to triage: ${stalePaths.join(', ')}` + (earlierDiff ? ` (earlier changes ${earliest.slice(0, 7)}..${from.slice(0, 7)}, ${earlierByPath.size} file(s))` : ''));
   }
 
-  // 5.6 manifest
-  const docPaths = [...new Set([...walkDocs(isEditableDoc), ...carried.keys()])];
+  // 5.6 manifest. Every Markdown file is kept for the inbound-link check on deletes.
+  const denied = L.makeMatcher(L.DENYLIST);
+  const allMarkdown = [...new Set([...walkDocs((p) => p.endsWith('.md') && !denied(p)), ...carried.keys()])].filter((p) => !tombstones.has(p));
+  const docPaths = allMarkdown.filter((p) => carried.has(p) || isEditableDoc(p));
   const manifest = L.buildManifest(docPaths.map((p) => ({ path: p, content: readCurrent(p) })));
   const manifestText = L.renderManifest(manifest);
   log(`Manifest: ${manifest.length} editable docs\n${manifestText}\n`);
@@ -365,30 +382,52 @@ async function main() {
   };
 
   // 5.7 triage
-  const prefix = L.writerPrefix({ guidelines: guidelines.text, narrative, diff: packed.diff, manifest: manifestText, stale: staleText });
-  const triageRaw = await callModel(models.triage, 'triage', { system: L.TRIAGE_SYSTEM, blocks: [{ text: prefix }], maxTokens: cfg.response_max_tokens });
-  const triage = L.parseTriage(triageRaw.text, { isEditableDocPath, exists: (p) => readCurrent(p) != null, maxDocs: cfg.max_docs_per_run });
+  const triageText = L.triageUser({ guidelines: guidelines.text, narrative, diff: packed.diff, manifest: manifestText, stale: staleText });
+  const triageRaw = await callModel(models.triage, 'triage', { system: L.TRIAGE_SYSTEM, blocks: [{ text: triageText }], maxTokens: cfg.response_max_tokens });
+  const triage = L.parseTriage(triageRaw.text, { isEditableDocPath, exists: (p) => readCurrent(p) != null || tombstones.has(p) });
   if (!triage) throw new Error('triage returned unparseable output (run with DEBUG=1 to see it)');
   for (const d of triage.dropped) warn(`triage named "${d.path}": ${d.reason}; dropped`);
-  log(`Triage: ${triage.affected.length} affected` + (triage.overflow.length ? `, ${triage.overflow.length} over max_docs_per_run` : '') + (triage.deleteCandidates.length ? `, ${triage.deleteCandidates.length} delete candidate(s)` : ''));
-  for (const a of triage.affected) log(`  ${a.action} ${a.path}: ${a.reason}${a.source_files.length ? ` [${a.source_files.join(', ')}]` : ''}`);
-  for (const a of triage.overflow) log(`  (not this run) ${a.path}: ${a.reason}`);
-  for (const d of triage.deleteCandidates) log(`  delete candidate ${d.path}: ${d.reason}`);
-  if (!triage.affected.length) log(`  ${triage.unaffectedReason || 'no reason given'}`);
+  for (const a of [...triage.affected, ...triage.deletes]) if (tombstones.has(a.path)) undeleted.add(a.path);
+
+  const codePaths = new Set([...classified.code.flatMap((c) => [c.path, c.oldPath]).filter(Boolean), ...earlierPaths]);
+  const delPlan = L.planDeletes({ deletes: triage.deletes, codePaths, readCurrent, guidelineFiles });
+  const markdownNow = () => allMarkdown.map((p) => ({ path: p, content: readCurrent(p) }));
+  const linkPlan = L.applyInboundLinks({
+    affected: triage.affected,
+    deletes: delPlan.deletes,
+    inbound: L.inboundLinks(markdownNow(), delPlan.deletes.map((d) => d.path)),
+    isEditableDoc,
+  });
+  const tasks = linkPlan.affected;
+  const deletes = linkPlan.deletes;
+  log(`Triage: ${triage.affected.length} affected, ${deletes.length} delete(s)` + (delPlan.suggested.length ? `, ${delPlan.suggested.length} suggested deletion(s)` : ''));
+  for (const a of tasks) log(`  ${a.action} ${a.path}: ${a.reason}${a.source_files.length ? ` [${a.source_files.join(', ')}]` : ''}`);
+  for (const d of deletes) log(`  delete ${d.path}: ${d.reason} [${d.source_files.join(', ')}]`);
+  for (const d of delPlan.suggested) log(`  suggested deletion ${d.path}: ${d.reason} (${d.why})`);
+  if (!tasks.length && !deletes.length) log(`  ${triage.unaffectedReason || 'no reason given'}`);
   if (TRIAGE_ONLY) {
     log(`TRIAGE_ONLY set; stopping. ${costLine(usage)}`);
     return;
   }
-  if (!triage.affected.length && !mustRefresh) {
+  if (!tasks.length && !deletes.length && !mustRefresh) {
     log(costLine(usage));
     moveCursor('No docs affected; nothing to write');
     return;
   }
 
   // 5.8 writer, one call per doc, cached prefix, concurrency of three
+  const deletedPaths = new Set(deletes.map((d) => d.path));
+  const prefix = L.writerPrefix({
+    guidelines: guidelines.text,
+    narrative,
+    diff: packed.diff,
+    manifest: L.renderManifest(manifest.filter((m) => !deletedPaths.has(m.path))),
+    stale: staleText,
+    deleted: deletes.map((d) => ({ path: d.path, reason: d.reason })),
+  });
   const heldBack = [];
   const patchByPath = new Map(patches.map((p) => [p.path, p]));
-  const writable = triage.affected.filter((a) => {
+  const writable = tasks.filter((a) => {
     const current = readCurrent(a.path);
     if (current != null && L.approxTokens(current) > cfg.max_doc_tokens) {
       heldBack.push({ path: a.path, reason: 'too large for a full rewrite in v1' });
@@ -396,6 +435,7 @@ async function main() {
     }
     return true;
   });
+  log(`Writer: ${writable.length} call(s) planned` + (heldBack.length ? `, ${heldBack.length} too large` : ''));
   const docPart = (a) =>
     L.writerDocPart({
       path: a.path,
@@ -434,43 +474,48 @@ async function main() {
   });
   log(`Writer: ${drafts.length} draft(s)` + (heldBack.length ? `, ${heldBack.length} held back` : ''));
 
-  // 5.9 checker, then at most one correction per file
-  let checked = null;
-  if (drafts.length) {
-    try {
-      const r = await callModel(models.checker, 'checker', {
-        system: L.CHECKER_SYSTEM,
-        blocks: [
-          {
-            text: L.checkerUser({
-              narrative,
-              diff: packed.diff,
-              stale: staleText,
-              docs: drafts.map((d) => ({ ...d, editDiff: L.unifiedDiff(d.current ?? '', d.content, d.path) })),
-            }),
-          },
-        ],
-        maxTokens: cfg.response_max_tokens,
-      });
-      checked = L.parseChecker(r.text);
-      if (!checked) warn('checker returned unparseable output; proceeding unchecked');
-    } catch (e) {
-      warn(`checker failed (${e.message}); proceeding unchecked`);
-    }
+  // 5.9 checker in batches, then at most one correction per file; a delete is never corrected
+  const toCheck = [...drafts.map((d) => ({ ...d, editDiff: L.unifiedDiff(d.current ?? '', d.content, d.path) })), ...deletes];
+  let verdicts = new Map();
+  if (toCheck.length) {
+    const r = await L.checkInBatches(toCheck, {
+      budget: cfg.checker_batch_tokens,
+      concurrency: cfg.writer_concurrency,
+      check: async (batch, i, n) => {
+        const res = await callModel(models.checker, n > 1 ? `checker ${i + 1}/${n}` : 'checker', {
+          system: L.CHECKER_SYSTEM,
+          blocks: [{ text: L.checkerUser({ narrative, diff: packed.diff, manifest: manifestText, stale: staleText, docs: batch }) }],
+          maxTokens: cfg.response_max_tokens,
+        });
+        return L.parseChecker(res.text);
+      },
+    });
+    verdicts = r.verdicts;
+    for (const f of r.failed)
+      warn(`checker ${f.error ? `failed (${f.error.message})` : 'returned unparseable output'}; proceeding unchecked for ${f.paths.join(', ')}`);
   }
   const toCorrect = [];
-  const candidates = [];
-  for (const d of drafts) {
-    const decision = L.decideAfterCheck(checked?.get(d.path));
+  let candidates = [];
+  for (const d of toCheck) {
+    const decision = L.decideAfterCheck(verdicts.get(d.path), d.action);
     const entry = { ...d, check: decision };
-    if (decision.action === 'drop') heldBack.push({ path: d.path, reason: `checker: drop (${decision.issues.map((i) => i.note).join('; ')})` });
+    if (decision.action === 'drop') heldBack.push({ path: d.path, reason: 'checker: drop' + (decision.issues.length ? ` (${decision.issues.map((i) => i.note).join('; ')})` : '') });
     else if (decision.action === 'correct') toCorrect.push(entry);
     else candidates.push(entry);
   }
-  if (toCorrect.length) {
-    log(`Correction pass for ${toCorrect.length} file(s)`);
-    const corrected = await L.mapConcurrent(toCorrect, cfg.writer_concurrency, (d) => writeDoc(d, '\n\n' + L.correctionPart({ draft: d.content, issues: d.check.issues })));
-    toCorrect.forEach((d, i) => {
+  // A delete the checker dropped takes its link fix-ups with it, before a correction is spent.
+  const alive = new Set([...toCorrect, ...candidates].map((d) => d.path));
+  const correctable = L.dropOrphanedDependents(toCorrect, alive);
+  heldBack.push(...correctable.orphaned);
+  const pruned = L.dropOrphanedDependents(candidates, alive);
+  heldBack.push(...pruned.orphaned);
+  candidates = pruned.kept;
+  if (correctable.kept.length) {
+    log(`Correction pass for ${correctable.kept.length} file(s)`);
+    const corrected = await L.mapConcurrent(correctable.kept, cfg.writer_concurrency, (d) =>
+      writeDoc(d, '\n\n' + L.correctionPart({ draft: d.content, issues: d.check.issues }))
+    );
+    correctable.kept.forEach((d, i) => {
       const content = corrected[i].content;
       if (content == null) warn(`correction for ${d.path} ${corrected[i].error ? 'failed' : 'unparseable'}; keeping the first draft`);
       candidates.push({ ...d, content: content ?? d.content, corrected: content != null });
@@ -478,16 +523,29 @@ async function main() {
   }
 
   // 5.10 gates
-  const format = candidates.length ? makeFormatter(cfg) : { mode: 'off' };
-  const { kept, dropped } = L.runGates(candidates, {
+  const format = candidates.some((c) => c.action !== 'delete') ? makeFormatter(cfg) : { mode: 'off' };
+  const gated = L.runGates(candidates, {
     isEditableDoc,
     readCurrent,
     readTarget: readCheckout,
     // Carried-forward creates live on the rolling branch only, so links to them must resolve.
     existsInCheckout: (p) => carried.has(p) || existsSync(join(ROOT, p)),
+    carriedDeletes: tombstones,
     guidelineFiles,
     format,
   });
+  const { dropped } = gated;
+  heldBack.push(...gated.orphaned);
+  const kept = gated.kept.filter((k) => k.action !== 'delete');
+  const keptEdits = new Map(kept.map((k) => [k.path, k.content]));
+  // On the final content, so a link fix-up that was held back still shows.
+  const keptDeletes = L.flagBrokenInbound(
+    gated.kept.filter((k) => k.action === 'delete'),
+    L.inboundLinks(
+      [...new Set([...allMarkdown, ...keptEdits.keys()])].map((p) => ({ path: p, content: keptEdits.has(p) ? keptEdits.get(p) : readCurrent(p) })),
+      gated.kept.filter((k) => k.action === 'delete').map((k) => k.path)
+    )
+  );
 
   // ------------------------------------------------------------- summary ---
 
@@ -505,17 +563,26 @@ async function main() {
       else log(`     FLAG ${f.kind}: ${f.detail.join(', ')}`);
     }
   }
+  for (const d of keptDeletes) {
+    log(`DELETE ${d.path} -- ${d.reason}` + (d.check?.unchecked ? '\n     unchecked' : ''));
+    for (const f of d.flags) {
+      if (f.kind === 'guideline_delete') log(`     FLAG guideline file deleted; removed content:\n${f.detail.replace(/^/gm, '       ')}`);
+      else log(`     FLAG ${f.kind}: ${f.detail.join(', ')}`);
+    }
+  }
   for (const d of dropped) log(`DROP ${d.path} -- gate ${d.gate}: ${d.reason}`);
   for (const h of heldBack) log(`HELD ${h.path} -- ${h.reason}`);
-  for (const s of staleCarried)
-    log(`STALE carried edit discarded, target changed ${s}; ` + (kept.some((k) => k.path === s) ? 'redone this run' : `not reselected (force with since=${L.regenerateFrom(prevRuns, s, carryBase)})`));
-  for (const a of triage.overflow) log(`ALSO likely affected, not edited this run: ${a.path}`);
-  for (const d of triage.deleteCandidates) log(`DELETE candidate (never acted on): ${d.path} -- ${d.reason}`);
+  const keptPaths = new Set([...kept, ...keptDeletes].map((k) => k.path));
+  for (const { path: p, kind } of staleCarried)
+    log(`STALE carried ${kind} discarded, target changed ${p}; ` + (keptPaths.has(p) ? 'redone this run' : `not reselected (force with since=${L.regenerateFrom(prevRuns, p, carryBase)})`));
+  for (const p of obsolete) log(`OBSOLETE carried change dropped, target deleted ${p}`);
+  for (const d of delPlan.suggested) log(`SUGGESTED deletion (not acted on): ${d.path} -- ${d.reason} (${d.why})`);
   if (carried.size) log(`CARRIED forward from earlier runs: ${[...carried.keys()].join(', ')}`);
+  if (tombstones.size) log(`CARRIED deletes from earlier runs: ${[...tombstones].join(', ')}`);
   if (packed.omitted.length) log(`DIFF over budget, not shown to the models: ${packed.omitted.join(', ')}`);
   log(costLine(usage));
 
-  if (!kept.length && !mustRefresh) {
+  if (!keptPaths.size && !mustRefresh) {
     moveCursor('Nothing survived the gates; the rolling PR is left as it is');
     return;
   }
@@ -523,10 +590,11 @@ async function main() {
   // ------------------------------------------------------------- publish ---
 
   const scope = L.commitScope(cfg.branch);
-  const keptPaths = new Set(kept.map((k) => k.path));
   const carriedOnly = [...carried.keys()].filter((p) => !keptPaths.has(p));
+  const carriedDeletesOnly = [...tombstones].filter((p) => !keptPaths.has(p));
   const title = L.prTitle({ scope, target: TARGET_BRANCH, to: head });
   const prBody = L.renderPrBody({
+    repo: REPO,
     target: TARGET_BRANCH,
     from,
     to: head,
@@ -534,12 +602,15 @@ async function main() {
     capped,
     runUrl: RUN_URL,
     kept,
-    carried: carriedOnly.map((p) => ({ path: p, run: L.lastRunFor(prevRuns, p) })),
-    stale: staleCarried.map((p) => ({ path: p, since: L.regenerateFrom(prevRuns, p, carryBase), redone: keptPaths.has(p) })),
+    deleted: keptDeletes,
+    carried: [
+      ...carriedOnly.map((p) => ({ path: p, run: L.lastRunFor(prevRuns, p) })),
+      ...carriedDeletesOnly.map((p) => ({ path: p, run: L.lastRunFor(prevRuns, p), deleted: true })),
+    ],
+    stale: staleCarried.map(({ path: p, kind }) => ({ path: p, kind, since: L.regenerateFrom(prevRuns, p, carryBase), redone: keptPaths.has(p) })),
     dropped,
     heldBack,
-    deleteCandidates: triage.deleteCandidates,
-    overflow: triage.overflow,
+    suggestedDeletes: delPlan.suggested,
     omittedDiff: packed.omitted,
     outline: L.narrativeOutline({ commits, linked, prs }),
     usage: { entries: usage.entries, total: usage.total(), unpriced: usage.unpriced() },
@@ -548,8 +619,13 @@ async function main() {
 
   if (DRY_RUN) {
     log(`\n===== DRY RUN -- would push ${cfg.branch} and ${openPr ? `update PR #${openPr.number}` : 'open a PR'} =====`);
-    log(`Files: ${[...keptPaths].join(', ')}` + (carriedOnly.length ? `; carried: ${carriedOnly.join(', ')}` : ''));
+    log(
+      `Files: ${[...keptPaths].join(', ')}` +
+        (carriedOnly.length ? `; carried: ${carriedOnly.join(', ')}` : '') +
+        (carriedDeletesOnly.length ? `; carried deletes: ${carriedDeletesOnly.join(', ')}` : '')
+    );
     for (const k of kept) log(`\n${L.unifiedDiff(k.current ?? '', k.content, k.path) || `(no textual diff for ${k.path})`}`);
+    for (const d of keptDeletes) log(`\n${L.unifiedDiff(d.current, '', d.path) || `(${d.path} is empty; deleted)`}`);
     log(`\n----- PR title -----\n${title}\n----- PR body -----\n${prBody}`);
     moveCursor('Dry run');
     return;
@@ -568,6 +644,7 @@ async function main() {
     git(['read-tree', head], { env });
     for (const p of carriedOnly) stage(carried.get(p).mode, carried.get(p).blob, p);
     for (const k of kept) stage(treeEntry(head, k.path)?.mode ?? '100644', git(['hash-object', '-w', '--stdin'], { input: k.content }), k.path);
+    for (const p of [...keptDeletes.map((d) => d.path), ...carriedDeletesOnly]) git(['update-index', '--force-remove', '--', p], { env });
     tree = git(['write-tree'], { env });
   } finally {
     rmSync(tmp, { recursive: true, force: true });
@@ -578,7 +655,17 @@ async function main() {
     return;
   }
   const commit = git(['commit-tree', '--no-gpg-sign', tree, '-p', head, '-F', '-'], {
-    input: L.commitMessage({ scope, from, to: head, target: TARGET_BRANCH, files: [...keptPaths], carried: carriedOnly, runUrl: RUN_URL }),
+    input: L.commitMessage({
+      scope,
+      from,
+      to: head,
+      target: TARGET_BRANCH,
+      files: kept.map((k) => k.path),
+      deleted: keptDeletes.map((d) => d.path),
+      carried: carriedOnly,
+      carriedDeleted: carriedDeletesOnly,
+      runUrl: RUN_URL,
+    }),
     env: { GIT_AUTHOR_NAME: L.BOT_NAME, GIT_AUTHOR_EMAIL: L.BOT_EMAIL, GIT_COMMITTER_NAME: L.BOT_NAME, GIT_COMMITTER_EMAIL: L.BOT_EMAIL },
   });
   // The lease pins the push to the branch state the ownership check inspected.
@@ -622,7 +709,7 @@ async function main() {
       body: {
         state: 'success',
         context: L.STATUS_CONTEXT,
-        description: `${kept.length} edited, ${dropped.length + heldBack.length} held back`,
+        description: `${kept.length} edited, ${keptDeletes.length} deleted, ${dropped.length + heldBack.length} held back`,
         ...(RUN_URL ? { target_url: RUN_URL } : {}),
       },
     });
