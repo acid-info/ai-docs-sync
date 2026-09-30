@@ -556,8 +556,9 @@ async function main() {
   heldBack.push(...gated.orphaned);
   const keptEdits = new Map(gated.kept.filter((k) => k.action !== 'delete').map((k) => [k.path, k.content]));
   const gone = new Set(gated.kept.filter((k) => k.action === 'delete').map((k) => k.path));
+  // An earlier run's create, edited again, is still new to the target.
   const kept = L.markNewDocLinks(
-    gated.kept.filter((k) => k.action !== 'delete'),
+    gated.kept.filter((k) => k.action !== 'delete').map((k) => (k.action === 'update' && !treeEntry(head, k.path) ? { ...k, action: 'create' } : k)),
     allMarkdown.filter((p) => !keptEdits.has(p) && !gone.has(p)).map((p) => ({ path: p, content: readCurrent(p) }))
   );
   // On the final content, so a link fix-up that was held back still shows.
@@ -627,7 +628,7 @@ async function main() {
     kept,
     deleted: keptDeletes,
     carried: [
-      ...carriedOnly.map((p) => ({ path: p, run: L.lastRunFor(prevRuns, p) })),
+      ...carriedOnly.map((p) => ({ path: p, run: L.lastRunFor(prevRuns, p), created: !treeEntry(head, p) })),
       ...carriedDeletesOnly.map((p) => ({ path: p, run: L.lastRunFor(prevRuns, p), deleted: true })),
     ],
     stale: staleCarried.map(({ path: p, kind }) => ({ path: p, kind, since: L.regenerateFrom(prevRuns, p, carryBase), redone: keptPaths.has(p) })),

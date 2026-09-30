@@ -2030,7 +2030,7 @@ export function renderPrBody({
       ),
       ...sec(
         'Carried forward from earlier runs (unchanged this run)',
-        carried.map((c) => `- ${inlineCode(c.path)}` + (c.deleted ? ' (deleted)' : '') + (detail && c.run ? ` (from \`${short7(c.run.from)}..${short7(c.run.to)}\`)` : ''))
+        carried.map((c) => `- ${inlineCode(c.path)}` + (c.deleted ? ' (deleted)' : c.created ? ' (new)' : '') + (detail && c.run ? ` (from \`${short7(c.run.from)}..${short7(c.run.to)}\`)` : ''))
       ),
       ...sec(
         `Earlier changes discarded because ${inlineCode(target)} changed the file`,

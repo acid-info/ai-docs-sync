@@ -225,6 +225,8 @@ just as it is never edited.
   that the diff does not justify. If a new doc is held back, so is the index update that would
   have linked it. The PR body lists new docs in their own section, above the edits, each with
   its reason, the checker's verdict and the doc that links to it, or "Not linked from any doc".
+  A new doc carried from an earlier run is marked "(new)", and listed as new again when a later
+  run edits it.
   To reject a new doc, delete it on the rolling branch and revert the index doc's link to it in
   the same commit: carried changes are not re-checked, so a link left behind stays broken in the
   PR. Closing the rolling PR also works, but drops every unmerged change on it.

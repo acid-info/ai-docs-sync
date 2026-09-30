@@ -1649,6 +1649,7 @@ describe('creating docs', () => {
       ],
       deleted: [{ path: 'docs/gone.md', action: 'delete', reason: 'gone', check: { action: 'proceed', issues: [] }, flags: [] }],
       heldBack: [{ path: 'misc/notes.md', reason: 'placement: no docs live near misc/' }],
+      carried: [{ path: 'docs/commands/older.md', created: true }, { path: 'docs/cli.md' }],
     });
     const at = ['Deleted this run', 'New docs', 'Edited this run', 'Held back'].map((h) => body.indexOf(`\n#### ${h}\n`));
     assert.ok(at.every((i) => i > 0) && [...at].sort((x, y) => x - y).join() === at.join(), body);
@@ -1657,5 +1658,6 @@ describe('creating docs', () => {
     const edited = body.slice(at[2], at[3]);
     assert.ok(edited.includes('`docs/index.md` (update)') && !edited.includes('(create)'), 'creates are not listed as edits');
     assert.match(body, /- `misc\/notes\.md` -- placement: no docs live near misc\//);
+    assert.match(body, /- `docs\/commands\/older\.md` \(new\)\n- `docs\/cli\.md`\n/, 'a create carried from an earlier run stays marked as new');
   });
 });
