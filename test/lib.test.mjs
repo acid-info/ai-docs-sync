@@ -81,8 +81,19 @@ import {
   writerPrefix,
   checkerUser,
   TRIAGE_SYSTEM,
+  CHECKER_SYSTEM,
+  WRITER_SYSTEM,
   renderPrBody,
   PR_BODY_MAX,
+  planDeletes,
+  inboundLinks,
+  applyInboundLinks,
+  flagBrokenInbound,
+  dropOrphanedDependents,
+  batchByTokens,
+  checkInBatches,
+  blobUrl,
+  MARKER_MAX_CHARS,
 } from '../lib.mjs';
 
 const CFG_TEXT = `
@@ -138,7 +149,7 @@ describe('config', () => {
   test('applies defaults and appends extra_ignore to the built-in list', () => {
     const c = cfg();
     assert.equal(c.branch, 'docs/repo/sync');
-    assert.equal(c.max_docs_per_run, 8);
+    assert.equal('max_docs_per_run' in c, false);
     assert.equal(c.format_check, 'off');
     assert.ok(c.ignore.includes('**/pnpm-lock.yaml'));
     assert.ok(c.ignore.includes('flake.lock'));
@@ -151,6 +162,16 @@ describe('config', () => {
     assert.equal(warnings.length, 2);
     assert.ok(!c.guidelines_files.includes('**/*.ts'));
     assert.ok(!c.ignore.includes('**/*.ts'));
+  });
+
+  test('max_docs_per_run gets the removed-key warning, not the centrally-owned one, and is ignored', () => {
+    const warnings = [];
+    const c = loadConfig(`${CFG_TEXT}\nmax_docs_per_run: 3\n`, { warn: (m) => warnings.push(m) });
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /max_docs_per_run was removed; every affected doc is written/);
+    assert.ok(!/owned centrally/.test(warnings[0]));
+    assert.equal('max_docs_per_run' in c, false);
+    assert.ok(!('max_docs_per_run' in DEFAULTS));
   });
 
   test('doc_paths is required', () => {
@@ -363,6 +384,11 @@ describe('changed files and loop guard', () => {
     assert.match(r.skipReason, /loop guard/);
   });
 
+  test('merging a rolling PR that only deletes docs trips the loop guard', () => {
+    const r = classifyChanges(parseNameStatus('D\0docs/api/architecture.md\0M\0README.md\0'), { isEditableDoc, isIgnored });
+    assert.match(r.skipReason, /loop guard/);
+  });
+
   test('lockfile-only pushes exit as no code files', () => {
     const r = classifyChanges(parseNameStatus('M\0pnpm-lock.yaml\0M\0flake.lock\0M\0README.md\0'), { isEditableDoc, isIgnored });
     assert.match(r.skipReason, /no code files/);
@@ -427,7 +453,7 @@ describe('manifest', () => {
 });
 
 describe('carry forward (read side) and guidelines', () => {
-  test('ownership: tool commits, merges and doc additions or edits by others are fine; anything else is foreign', () => {
+  test('ownership: tool commits, merges and doc additions, edits and deletes by others are fine; anything else is foreign', () => {
     const m = (path) => ({ status: 'M', path });
     const changes = {
       tool: [m('docs/a.md')],
@@ -435,7 +461,10 @@ describe('carry forward (read side) and guidelines', () => {
       suggestion: [m('docs/a.md'), { status: 'A', path: 'docs/new.md' }],
       code: [m('docs/a.md'), m('src/x.ts')],
       removal: [{ status: 'D', path: 'docs/a.md' }],
-      rename: [{ status: 'R', path: 'docs/b.md', oldPath: 'docs/a.md' }],
+      // --no-renames: a rename arrives as D + A
+      rename: [{ status: 'D', path: 'docs/a.md' }, { status: 'A', path: 'docs/b.md' }],
+      renameOut: [{ status: 'D', path: 'docs/a.md' }, { status: 'A', path: 'src/a.md' }],
+      codeDelete: [{ status: 'D', path: 'src/x.ts' }],
     };
     const opts = { changesOf: (sha) => changes[sha], isEditableDoc: (f) => f.startsWith('docs/') };
     const tool = { sha: 'tool', email: BOT_EMAIL, authorEmail: BOT_EMAIL, parents: ['p'] };
@@ -450,19 +479,44 @@ describe('carry forward (read side) and guidelines', () => {
     assert.equal(foreignBranchCommit([suggestion], opts), suggestion, 'a branch the tool never committed to');
     const rebased = { ...tool, email: web };
     assert.equal(foreignBranchCommit([rebased], opts), null, '"Update with rebase" keeps the tool as author');
-    for (const sha of ['removal', 'rename']) {
+    for (const sha of ['removal', 'rename']) assert.equal(foreignBranchCommit([{ ...suggestion, sha }, tool], opts), null, `a reviewer ${sha} is carried`);
+    for (const sha of ['renameOut', 'codeDelete']) {
       const c = { ...suggestion, sha };
-      assert.equal(foreignBranchCommit([c, tool], opts), c, `carry-forward cannot carry a ${sha}`);
+      assert.equal(foreignBranchCommit([c, tool], opts), c, `${sha} still refuses`);
     }
   });
 
-  test('restore/stale plan', () => {
+  test('carry-forward plan: restore, tombstones, stale by kind, obsolete, ignored', () => {
+    const target = new Set(['docs/a.md', 'docs/b.md', 'docs/d.md', 'docs/e.md', 'docs/new-on-target.md']);
+    const changedOnTarget = new Set(['docs/b.md', 'docs/e.md', 'docs/gone.md', 'docs/gone-del.md', 'docs/new-on-target.md']);
     const plan = planCarryForward({
-      branchFiles: ['docs/a.md', 'docs/b.md', 'src/x.ts'],
-      targetChangedSinceBase: (f) => f === 'docs/b.md',
-      isEditableDoc: (f) => f.endsWith('.md'),
+      branchChanges: [
+        { status: 'M', path: 'docs/a.md' },
+        { status: 'M', path: 'docs/b.md' },
+        { status: 'A', path: 'docs/c.md' },
+        { status: 'D', path: 'docs/d.md' },
+        { status: 'D', path: 'docs/e.md' },
+        { status: 'M', path: 'docs/gone.md' },
+        { status: 'D', path: 'docs/gone-del.md' },
+        { status: 'A', path: 'docs/new-on-target.md' },
+        { status: 'M', path: 'src/x.ts' },
+        { status: 'T', path: 'docs/t.md' },
+      ],
+      targetHas: (f) => target.has(f),
+      targetChangedSinceBase: (f) => changedOnTarget.has(f),
+      isEditableDoc: (f) => f.endsWith('.md') && f.startsWith('docs/'),
     });
-    assert.deepEqual(plan, { restore: ['docs/a.md'], stale: ['docs/b.md'], ignored: ['src/x.ts'] });
+    assert.deepEqual(plan, {
+      restore: ['docs/a.md', 'docs/c.md'],
+      restoreDeletes: ['docs/d.md'],
+      stale: [
+        { path: 'docs/b.md', kind: 'edit' },
+        { path: 'docs/e.md', kind: 'delete' },
+        { path: 'docs/new-on-target.md', kind: 'edit' },
+      ],
+      obsolete: ['docs/gone.md', 'docs/gone-del.md'],
+      ignored: ['src/x.ts', 'docs/t.md'],
+    });
   });
 
   test('AGENTS.md files are gathered from the root and touched directories', () => {
@@ -484,8 +538,9 @@ describe('carry forward (read side) and guidelines', () => {
 // ------------------------------------------------------------------- phase 2 ---
 
 describe('triage parser', () => {
-  const opts = { isEditableDocPath: makeIsEditableDocPath(cfg()), exists: (p) => p === 'docs/api/architecture.md', maxDocs: 2 };
-  test('accepts a good answer, decides the action from existence, drops disallowed paths, caps', () => {
+  const existing = new Set(['docs/api/architecture.md', 'docs/civi-crm/architecture.md']);
+  const opts = { isEditableDocPath: makeIsEditableDocPath(cfg()), exists: (p) => existing.has(p) };
+  test('accepts a good answer, decides the action from existence, drops disallowed paths, never caps', () => {
     const text = `Here you go:\n\`\`\`json\n${JSON.stringify({
       affected: [
         { path: 'docs/api/architecture.md', action: 'create', reason: 'moved', source_files: ['apps/api/x.ts', '../../evil'] },
@@ -493,26 +548,119 @@ describe('triage parser', () => {
         { path: 'docs/../../x.md', action: 'update', reason: 'no' },
         { path: 'apps/api/README.md', action: 'update', reason: 'new app' },
         { path: 'docs/api/architecture.md', action: 'update', reason: 'dupe' },
-        { path: 'docs/extra.md', action: 'create', reason: 'overflow' },
+        ...Array.from({ length: 12 }, (_, i) => ({ path: `docs/extra-${i}.md`, action: 'create', reason: 'more' })),
       ],
-      delete_candidates: [{ path: 'docs/civi-crm/architecture.md', reason: 'removed' }],
+      delete_candidates: [{ path: 'docs/civi-crm/architecture.md', reason: 'legacy field' }],
       unaffected_reason: '',
     })}\n\`\`\``;
     const r = parseTriage(text, opts);
-    assert.deepEqual(r.affected.map((a) => [a.path, a.action]), [['docs/api/architecture.md', 'update'], ['apps/api/README.md', 'create']]);
+    assert.deepEqual(r.affected.slice(0, 2).map((a) => [a.path, a.action]), [['docs/api/architecture.md', 'update'], ['apps/api/README.md', 'create']]);
+    assert.equal(r.affected.length, 14, 'no per-run cap');
     assert.deepEqual(r.affected[0].source_files, ['apps/api/x.ts']);
-    assert.deepEqual(r.overflow.map((a) => a.path), ['docs/extra.md']);
     assert.deepEqual(r.dropped.map((d) => d.path), ['content/blog/x.md', 'docs/../../x.md']);
-    assert.equal(r.deleteCandidates[0].path, 'docs/civi-crm/architecture.md');
+    assert.equal('overflow' in r, false);
+    assert.deepEqual(r.deletes, [], 'legacy delete_candidates ignored');
+  });
+  test('a delete is kept for an existing doc and dropped for a missing one', () => {
+    const r = parseTriage(
+      JSON.stringify({
+        affected: [
+          { path: 'docs/civi-crm/architecture.md', action: 'delete', reason: 'CRM app removed', source_files: ['apps/civi-crm/index.ts'] },
+          { path: 'docs/never-was.md', action: 'delete', reason: 'x' },
+        ],
+      }),
+      opts
+    );
+    assert.deepEqual(r.deletes, [{ path: 'docs/civi-crm/architecture.md', action: 'delete', reason: 'CRM app removed', source_files: ['apps/civi-crm/index.ts'] }]);
+    assert.deepEqual(r.affected, []);
+    assert.deepEqual(r.dropped, [{ path: 'docs/never-was.md', reason: 'delete of a doc that does not exist' }]);
+  });
+  test('delete beats update on the same path, in either order', () => {
+    for (const order of [['update', 'delete'], ['delete', 'update']]) {
+      const r = parseTriage(JSON.stringify({ affected: order.map((action) => ({ path: 'docs/api/architecture.md', action, reason: action })) }), opts);
+      assert.deepEqual(r.deletes.map((d) => d.path), ['docs/api/architecture.md'], order.join(','));
+      assert.deepEqual(r.affected, []);
+    }
   });
   test('returns null on unparseable or schema-less output', () => {
     assert.equal(parseTriage('not json', opts), null);
     assert.equal(parseTriage('{"foo": 1}', opts), null);
   });
   test('empty affected is a valid, complete answer', () => {
-    const r = parseTriage('{"affected": [], "delete_candidates": [], "unaffected_reason": "deps only"}', opts);
+    const r = parseTriage('{"affected": [], "unaffected_reason": "deps only"}', opts);
     assert.equal(r.affected.length, 0);
     assert.equal(r.unaffectedReason, 'deps only');
+  });
+  test('the prompt offers delete and no longer asks for delete_candidates', () => {
+    assert.match(TRIAGE_SYSTEM, /"update" \| "create" \| "delete"/);
+    assert.ok(!TRIAGE_SYSTEM.includes('delete_candidates'));
+  });
+});
+
+describe('delete plan', () => {
+  const del = (path, source_files) => ({ path, action: 'delete', reason: 'gone', source_files });
+  const readCurrent = (p) => `# ${p}\n`;
+  test('kept with a cited code path in range, downgraded to a suggestion with none', () => {
+    const r = planDeletes({ deletes: [del('docs/a.md', ['apps/a/index.ts']), del('docs/b.md', ['README.md']), del('docs/c.md', [])], codePaths: new Set(['apps/a/index.ts']), readCurrent });
+    assert.deepEqual(r.deletes.map((d) => d.path), ['docs/a.md']);
+    assert.equal(r.deletes[0].current, '# docs/a.md\n');
+    assert.deepEqual(r.suggested.map((d) => [d.path, d.why]), [['docs/b.md', 'no cited source file is in the diff'], ['docs/c.md', 'no cited source file is in the diff']]);
+  });
+  test('a path from the earlier (stale) diff or the old side of a rename counts', () => {
+    const codePaths = new Set(['apps/old/x.ts', 'apps/new/x.ts', 'apps/earlier.ts']);
+    const r = planDeletes({ deletes: [del('docs/a.md', ['apps/old/x.ts']), del('docs/b.md', ['apps/earlier.ts'])], codePaths, readCurrent });
+    assert.equal(r.deletes.length, 2);
+  });
+  test('a guideline delete is flagged with the removed content as the diff', () => {
+    const r = planDeletes({ deletes: [del('apps/api/AGENTS.md', ['apps/api/x.ts'])], codePaths: new Set(['apps/api/x.ts']), readCurrent, guidelineFiles: new Set() });
+    const g = r.deletes[0].flags.find((f) => f.kind === 'guideline_delete');
+    assert.match(g.detail, /^--- a\/apps\/api\/AGENTS\.md\n\+\+\+ b\/apps\/api\/AGENTS\.md\n@@ -1,1 \+0,0 @@\n-# apps\/api\/AGENTS\.md\n$/);
+  });
+});
+
+describe('inbound links to deleted docs', () => {
+  const files = [
+    { path: 'README.md', content: '# r\n\nSee [crm](/docs/civi%20crm/arch.md) and [api](docs/api.md).\n' },
+    { path: 'docs/api.md', content: '# api\n\n```md\n[example](./civi%20crm/arch.md)\n```\nNo live link here.\n' },
+    { path: 'docs/guide.md', content: '# g\n\n[crm](civi%20crm/arch.md#setup)\n' },
+    { path: 'docs/civi crm/other.md', content: '[sibling](./arch.md)\n' },
+    { path: 'docs/specs/old.md', content: '[crm](../civi%20crm/arch.md)\n' },
+    { path: 'docs/civi crm/arch.md', content: '[self](./arch.md)\n' },
+  ];
+  const deleted = ['docs/civi crm/arch.md', 'docs/civi crm/other.md'];
+  test('finds linkers, resolving root and percent-encoded links, skipping fences and deleted docs', () => {
+    const inbound = inboundLinks(files, deleted);
+    assert.deepEqual(inbound.get('docs/civi crm/arch.md'), ['README.md', 'docs/guide.md', 'docs/specs/old.md']);
+    assert.deepEqual(inbound.get('docs/civi crm/other.md'), []);
+  });
+  test('editable linker gets a dependent task; an affected one gets the reason appended; a non-editable one is flagged', () => {
+    const inbound = inboundLinks(files, deleted);
+    const deletes = [{ path: 'docs/civi crm/arch.md', action: 'delete', reason: 'the CRM app was removed', source_files: ['apps/crm/x.ts'], flags: [] }];
+    const affected = [{ path: 'README.md', action: 'update', reason: 'New app listed.', source_files: ['apps/new/x.ts'] }];
+    const r = applyInboundLinks({ affected, deletes, inbound, isEditableDoc: (p) => !p.startsWith('docs/specs/') });
+    const readme = r.affected.find((a) => a.path === 'README.md');
+    assert.equal(readme.reason, 'New app listed. Also remove or retarget the link(s) to docs/civi crm/arch.md, deleted this run because the CRM app was removed.');
+    assert.equal(readme.dependsOn, undefined);
+    assert.deepEqual(r.affected.find((a) => a.path === 'docs/guide.md'), {
+      path: 'docs/guide.md',
+      action: 'update',
+      reason: 'Remove or retarget the link(s) to docs/civi crm/arch.md, deleted this run because the CRM app was removed.',
+      source_files: ['apps/crm/x.ts'],
+      dependsOn: ['docs/civi crm/arch.md'],
+    });
+    assert.deepEqual(r.deletes[0].flags, [{ kind: 'broken_inbound_links', detail: ['docs/specs/old.md'] }]);
+    assert.equal(affected[0].reason, 'New app listed.', 'input not mutated');
+  });
+  test('flagBrokenInbound replaces an earlier flag and drops it when nothing links', () => {
+    const d = [{ path: 'x.md', flags: [{ kind: 'broken_inbound_links', detail: ['a.md'] }, { kind: 'guideline_delete', detail: '' }] }];
+    assert.deepEqual(flagBrokenInbound(d, new Map([['x.md', ['c.md', 'b.md']]]))[0].flags.map((f) => f.detail), ['', ['b.md', 'c.md']]);
+    assert.deepEqual(flagBrokenInbound(d, new Map())[0].flags.map((f) => f.kind), ['guideline_delete']);
+  });
+  test('dropOrphanedDependents drops tasks whose dependency is gone', () => {
+    const tasks = [{ path: 'a.md' }, { path: 'b.md', dependsOn: ['x.md'] }, { path: 'c.md', dependsOn: ['y.md'] }];
+    const r = dropOrphanedDependents(tasks, new Set(['a.md', 'x.md']));
+    assert.deepEqual(r.kept.map((t) => t.path), ['a.md', 'b.md']);
+    assert.deepEqual(r.orphaned, [{ path: 'c.md', reason: 'depends on y.md, which was held back' }]);
   });
 });
 
@@ -554,6 +702,53 @@ describe('checker parser and the single-correction rule', () => {
     assert.equal(decideAfterCheck({ verdict: 'revise', issues: [{ severity: 'should', note: 'x' }] }).action, 'proceed');
     assert.equal(decideAfterCheck({ verdict: 'revise', issues: [{ severity: 'must', note: 'x' }] }).action, 'correct');
     assert.equal(decideAfterCheck({ verdict: 'drop', issues: [] }).action, 'drop');
+  });
+  test('decideAfterCheck for a delete: drop or proceed, never correct', () => {
+    const must = { verdict: 'revise', issues: [{ severity: 'must', note: 'subject still exists' }] };
+    assert.equal(decideAfterCheck(must, 'delete').action, 'drop');
+    assert.equal(decideAfterCheck({ verdict: 'drop', issues: [] }, 'delete').action, 'drop');
+    assert.equal(decideAfterCheck({ verdict: 'ok', issues: [] }, 'delete').action, 'proceed');
+    assert.equal(decideAfterCheck({ verdict: 'revise', issues: [{ severity: 'should', note: 'x' }] }, 'delete').action, 'proceed');
+    assert.equal(decideAfterCheck(undefined, 'delete').unchecked, true);
+  });
+  test('checker input renders deletes with their current content and the manifest', () => {
+    const text = checkerUser({
+      narrative: 'n',
+      diff: 'd',
+      manifest: '- docs/a.md',
+      docs: [{ path: 'docs/gone.md', action: 'delete', reason: 'removed', source_files: ['apps/x.ts'], current: '# gone\n' }],
+    });
+    assert.match(text, /<manifest>\n- docs\/a\.md\n<\/manifest>/);
+    assert.match(text, /<doc path="docs\/gone\.md" action="delete">\n<reason>removed<\/reason>\n<source_files>apps\/x\.ts<\/source_files>\n<current_content>\n# gone\n\n<\/current_content>\n<\/doc>/);
+    assert.match(CHECKER_SYSTEM, /Never\s+"revise" a delete/);
+  });
+});
+
+describe('checker batching', () => {
+  const doc = (path, chars) => ({ path, action: 'update', reason: 'r', editDiff: '', content: 'x'.repeat(chars) });
+  test('splits by budget and keeps an oversized doc alone', () => {
+    const docs = [doc('a', 100), doc('b', 100), doc('huge', 10_000), doc('c', 100)];
+    const batches = batchByTokens(docs, 100, (d) => approxTokens(d.content));
+    assert.deepEqual(batches.map((b) => b.map((d) => d.path)), [['a', 'b'], ['huge'], ['c']]);
+  });
+  test('merges verdicts; a failed batch leaves only its own files unchecked', async () => {
+    const docs = [doc('docs/a.md', 400), doc('docs/b.md', 400), doc('docs/c.md', 400)];
+    const seen = [];
+    const r = await checkInBatches(docs, {
+      budget: 150,
+      concurrency: 2,
+      check: async (batch) => {
+        seen.push(batch.map((d) => d.path));
+        if (batch[0].path === 'docs/b.md') throw new Error('500');
+        if (batch[0].path === 'docs/c.md') return null;
+        return new Map([...batch.map((d) => [d.path, { verdict: 'ok', issues: [] }]), ['docs/b.md', { verdict: 'drop', issues: [] }]]);
+      },
+    });
+    assert.equal(r.batches, 3);
+    assert.deepEqual([...r.verdicts.keys()], ['docs/a.md'], 'a verdict for a file outside its batch is ignored');
+    assert.deepEqual(r.failed.map((f) => f.paths), [['docs/b.md'], ['docs/c.md']]);
+    assert.match(r.failed[0].error.message, /500/);
+    assert.equal(decideAfterCheck(r.verdicts.get('docs/b.md')).unchecked, true);
   });
 });
 
@@ -861,6 +1056,63 @@ describe('gates', () => {
     }
   });
 
+  test('a delete runs gate 0 and "exists", and flags a guideline file', () => {
+    const root = tmpRepo(files);
+    try {
+      const { kept, dropped } = runGates(
+        [
+          { path: 'docs/civi-crm/architecture.md', action: 'delete', reason: 'gone' },
+          { path: 'AGENTS.md', action: 'delete', reason: 'gone' },
+          { path: 'docs/missing.md', action: 'delete', reason: 'gone' },
+          { path: '.github/x.md', action: 'delete', reason: 'gone' },
+        ],
+        ctx(root)
+      );
+      assert.deepEqual(kept.map((k) => k.path), ['docs/civi-crm/architecture.md', 'AGENTS.md']);
+      assert.deepEqual(kept[0].flags, []);
+      assert.match(kept[1].flags.find((f) => f.kind === 'guideline_delete').detail, /^-# rules$/m);
+      assert.deepEqual(dropped.map((d) => [d.path, d.gate, d.reason]), [['docs/missing.md', 1, 'nothing to delete'], ['.github/x.md', 0, 'path outside the editable allowlist']]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('gate 2: a link added to a doc deleted this run or carried as deleted fails', () => {
+    const root = tmpRepo(files);
+    try {
+      const add = (link) => ({ path: 'docs/api/architecture.md', action: 'update', content: OLD.replace('posts.', `posts. See [x](${link}).`) });
+      let r = runGates([add('../civi-crm/architecture.md'), { path: 'docs/civi-crm/architecture.md', action: 'delete', reason: 'gone' }], ctx(root));
+      assert.deepEqual(r.kept.map((k) => k.path), ['docs/civi-crm/architecture.md']);
+      assert.equal(r.dropped[0].gate, 2);
+      r = runGates([add('../../README.md')], ctx(root, { carriedDeletes: new Set(['README.md']) }));
+      assert.equal(r.dropped[0].gate, 2);
+      r = runGates([add('../../README.md'), { path: 'README.md', action: 'update', content: '# r\n\nrestored\n' }], ctx(root, { carriedDeletes: new Set(['README.md']) }));
+      assert.deepEqual(r.kept.map((k) => k.path), ['docs/api/architecture.md', 'README.md'], 'an un-delete this run puts it back in the tree');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('fixpoint: a create dropped at gate 4 takes a link to it down at gate 2, and its dependents go too', () => {
+    const root = tmpRepo(files);
+    try {
+      const { kept, dropped, orphaned } = runGates(
+        [
+          { path: 'docs/api/architecture.md', action: 'update', content: OLD.replace('posts.', 'posts. See [n](../new.md).') },
+          { path: 'docs/new.md', action: 'create', content: '# new\n\nCo-Authored-By: x\n' },
+          { path: 'docs/civi-crm/architecture.md', action: 'update', content: '# crm\n\nfixed\n', dependsOn: ['docs/gone.md'] },
+          { path: 'README.md', action: 'update', content: '# r\n\nfine\n' },
+        ],
+        ctx(root)
+      );
+      assert.deepEqual(kept.map((k) => k.path), ['README.md']);
+      assert.deepEqual(dropped.map((d) => [d.path, d.gate]), [['docs/new.md', 4], ['docs/api/architecture.md', 2]]);
+      assert.deepEqual(orphaned, [{ path: 'docs/civi-crm/architecture.md', reason: 'depends on docs/gone.md, which was held back' }]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test('gate 0 accepts only the exact canonical path', () => {
     assert.equal(gateAllowlist({ path: 'docs//x.md' }, { isEditableDoc: () => true }).ok, false);
     assert.equal(gateAllowlist({ path: 'docs/x.md' }, { isEditableDoc: () => true }).ok, true);
@@ -957,8 +1209,8 @@ describe('publishing helpers', () => {
   test('commit scope, subject and body follow the fixed template', () => {
     assert.equal(commitScope('docs/web/sync'), 'web');
     assert.equal(commitScope('docs-sync'), 'repo');
-    const msg = commitMessage({ scope: 'web', from: 'a'.repeat(40), to: 'b'.repeat(40), target: 'develop', files: ['docs/x.md'], carried: ['README.md'], runUrl: 'https://r' });
-    assert.match(msg, /^docs\(web\): sync with aaaaaaa\.\.bbbbbbb\n\nRange: a{40}\.\.b{40} on develop\n\nFiles:\n- docs\/x\.md\n- README\.md \(carried forward\)\n\nRun: https:\/\/r\n$/);
+    const msg = commitMessage({ scope: 'web', from: 'a'.repeat(40), to: 'b'.repeat(40), target: 'develop', files: ['docs/x.md'], deleted: ['docs/gone.md'], carried: ['README.md'], carriedDeleted: ['docs/old.md'], runUrl: 'https://r' });
+    assert.match(msg, /^docs\(web\): sync with aaaaaaa\.\.bbbbbbb\n\nRange: a{40}\.\.b{40} on develop\n\nFiles:\n- docs\/x\.md\n- docs\/gone\.md \(deleted\)\n- README\.md \(carried forward\)\n- docs\/old\.md \(deleted, carried forward\)\n\nRun: https:\/\/r\n$/);
     assert.ok(!/co-authored|generated/i.test(msg));
     assert.equal(prTitle({ scope: 'web', target: 'develop', to: 'c'.repeat(40) }), 'docs(web): sync docs with develop (up to ccccccc)');
   });
@@ -982,6 +1234,15 @@ describe('publishing helpers', () => {
     assert.deepEqual(parseMarker('<!-- ai-docs-sync {broken -->'), []);
     const many = Array.from({ length: 30 }, (_, i) => ({ at: '', from: String(i), to: '', files: [] }));
     assert.equal(renderMarker(many).match(/"from":/g).length, 20, 'keeps the last 20');
+    const wide = [{ at: '', from: 'a', to: 'b', files: Array.from({ length: 300 }, (_, i) => `docs/f${i}.md`) }];
+    assert.equal(parseMarker(renderMarker(wide))[0].files.length, 300, 'no per-run file cap');
+    const big = Array.from({ length: 10 }, (_, i) => ({ at: '', from: `${i}`, to: '', files: Array.from({ length: 200 }, (_, j) => `docs/run${i}/file-${j}.md`) }));
+    const sized = renderMarker(big);
+    assert.ok(sized.length <= MARKER_MAX_CHARS, `${sized.length}`);
+    const left = parseMarker(sized);
+    assert.ok(left.length < 10 && left.length >= 1);
+    assert.equal(left.at(-1).from, '9', 'the oldest runs go first');
+    assert.equal(parseMarker(renderMarker([big[0]], 100)).length, 1, 'the newest run always stays');
     const hist = [{ from: 'f1', to: '1', files: ['a.md'] }, { from: 'f2', to: '2', files: ['a.md', 'b.md'] }];
     assert.equal(lastRunFor(hist, 'a.md').to, '2');
     assert.equal(regenerateFrom(hist, 'a.md', 'base'), 'f1', 'the earliest run that touched it');
@@ -1004,6 +1265,7 @@ describe('publishing helpers', () => {
 
 describe('PR body', () => {
   const base = () => ({
+    repo: 'o/r',
     target: 'develop',
     from: 'a'.repeat(40),
     to: 'b'.repeat(40),
@@ -1027,43 +1289,70 @@ describe('PR body', () => {
         flags: [{ kind: 'guideline_edit', detail: '--- a/AGENTS.md\n+++ b/AGENTS.md\n@@ -1 +1 @@\n-old\n+new ``` closes #3\n' }],
       },
     ],
-    carried: [{ path: 'README.md', run: { from: '1111111aaa', to: '2222222bbb' } }],
+    deleted: [
+      {
+        path: 'docs/crm (old).md',
+        action: 'delete',
+        reason: 'CRM app removed',
+        check: { action: 'proceed', issues: [] },
+        flags: [{ kind: 'broken_inbound_links', detail: ['docs/specs/x.md'] }],
+      },
+      {
+        path: 'apps/crm/CLAUDE.md',
+        action: 'delete',
+        reason: 'CRM app removed',
+        check: { action: 'proceed', issues: [] },
+        flags: [{ kind: 'guideline_delete', detail: '--- a/apps/crm/CLAUDE.md\n+++ b/apps/crm/CLAUDE.md\n@@ -1,1 +0,0 @@\n-rule\n' }],
+      },
+    ],
+    carried: [{ path: 'README.md', run: { from: '1111111aaa', to: '2222222bbb' } }, { path: 'docs/was.md', deleted: true }],
     stale: [
       { path: 'docs/old.md', since: 'c'.repeat(40), redone: false },
       { path: 'docs/api.md', since: 'd'.repeat(40), redone: true },
+      { path: 'docs/del.md', since: 'e'.repeat(40), redone: false, kind: 'delete' },
     ],
     dropped: [{ path: 'docs/bad.md', gate: 2, reason: 'broken relative link(s): ./@nope.md' }],
     heldBack: [{ path: 'docs/huge.md', reason: 'too large for a full rewrite in v1' }],
-    deleteCandidates: [{ path: 'docs/gone.md', reason: 'App removed' }],
-    overflow: [{ path: 'docs/later.md', reason: 'also stale' }],
+    suggestedDeletes: [{ path: 'docs/gone.md', reason: 'App removed', why: 'no cited source file is in the diff' }],
     omittedDiff: ['big/file.ts'],
     outline: [{ pr: { number: 153, title: 'refactor: move funnel, closes #99' }, commits: [{ short: 'abc1234', subject: 'refactor @bob' }] }],
     usage: { entries: [{ label: 'triage', model: 'claude-sonnet-5', input: 10, cacheRead: 0, output: 5, cost: 0.001 }], total: 0.001, unpriced: [] },
-    runs: [{ at: 't', from: 'a', to: 'b', files: ['docs/api.md', 'AGENTS.md'] }],
+    runs: [{ at: 't', from: 'a', to: 'b', files: ['docs/api.md', 'AGENTS.md', 'docs/crm (old).md', 'apps/crm/CLAUDE.md'] }],
   });
 
-  test('renders every section, bannered guideline diff first, everything defused', () => {
+  test('renders every section, bannered guideline diffs first, everything defused', () => {
     const body = renderPrBody(base());
-    assert.ok(body.startsWith('> [!WARNING]\n> **Guideline file edited: `AGENTS.md`.**'), 'banner at the very top');
+    assert.ok(body.startsWith('> [!WARNING]\n> **Guideline file deleted: `apps/crm/CLAUDE.md`.**'), 'delete banner at the very top');
+    assert.match(body, /> \*\*Guideline file edited: `AGENTS\.md`\.\*\*/);
     assert.match(body, /````diff\n[\s\S]*\+new ``` closes #​3\n````/, 'fence outlasts the backticks in the diff, keyword defused');
-    for (const h of ['Edited this run', 'Carried forward', 'Earlier edits discarded because `develop` changed the file', 'Held back', 'New links, raw HTML and vendor names to check', 'Delete candidates', 'Also likely affected', 'Diff not shown', 'Commits and PRs in this range', 'API usage'])
-      assert.ok(body.includes(`\n#### ${h}`), h);
+    const headings = ['Deleted this run', 'Edited this run', 'Carried forward', 'Earlier changes discarded because `develop` changed the file', 'Held back', 'New links, raw HTML and vendor names to check', 'Suggested deletions (not acted on)', 'Diff not shown', 'Commits and PRs in this range', 'API usage'];
+    for (const h of headings) assert.ok(body.includes(`\n#### ${h}`), h);
+    const at = headings.map((h) => body.indexOf(`\n#### ${h}`));
+    assert.deepEqual([...at].sort((x, y) => x - y), at, 'sections in order: deletes before edits');
+    assert.ok(!body.includes('Also likely affected') && !body.includes('Delete candidates'));
     assert.ok(!/^#{1,3} /m.test(body), 'no heading above level 4');
-    assert.ok(!body.includes('Nothing merges without a human'));
     assert.match(body, /thanks @​alice, fixes #​12 &lt;!--/);
     assert.match(body, /addressed in the correction pass:\n    - \[must\] Claims hCaptcha &lt;b&gt;still&lt;\/b&gt; runs/);
     assert.match(body, /Checker: \*\*unchecked\*\*/);
     assert.match(body, /2 line\(s\) had en\/em dashes replaced/);
+    assert.match(body, /- `docs\/crm \(old\)\.md` -- CRM app removed\n  - Checker: ok\n  - Still linked from, not fixed here: `docs\/specs\/x\.md`\n  - To restore it: \[bbbbbbb copy\]\(https:\/\/github\.com\/o\/r\/blob\/b{40}\/docs\/crm%20%28old%29\.md\)/);
     assert.match(body, /`README\.md` \(from `1111111\.\.2222222`\)/);
+    assert.match(body, /- `docs\/was\.md` \(deleted\)/);
     assert.match(body, /`docs\/old\.md`: triage was asked again and did not select it\. To force it, re-run with `since=c{40}`/);
+    assert.match(body, /`docs\/del\.md` \(delete\): triage was asked again/);
     assert.match(body, /`docs\/api\.md`: redone this run on top of the new version/);
     assert.match(body, /gate 2: broken relative link\(s\): \.\/@​nope\.md/);
     assert.match(body, /new URLs: `https:\/\/evil\.example\/@​x`/);
+    assert.match(body, /- `docs\/gone\.md` -- App removed \(no cited source file is in the diff\)/);
     assert.match(body, /- #153 refactor: move funnel, closes #​99\n  - `abc1234` refactor @​bob/);
     assert.match(body, /Total ~\$0\.0010/);
     assert.ok(!/<!--(?! ai-docs-sync )/.test(body), 'the only HTML comment is the marker');
     assert.equal(body.match(/-->/g).length, 1);
     assert.deepEqual(parseMarker(body), base().runs);
+  });
+
+  test('restore links escape characters that would end a Markdown link', () => {
+    assert.equal(blobUrl('o/r', 'abc', 'docs/a (b)/c d.md'), 'https://github.com/o/r/blob/abc/docs/a%20%28b%29/c%20d.md');
   });
 
   test('over the cap the narrative is trimmed first and the marker survives', () => {
@@ -1072,14 +1361,52 @@ describe('PR body', () => {
     assert.ok(body.length <= PR_BODY_MAX, `${body.length}`);
     assert.match(body, /more line\(s\) not shown/);
     assert.match(body, /#### API usage/, 'sections after the narrative are kept');
+    assert.match(body, /\[must\] Claims hCaptcha/, 'no detail shed while the narrative alone is over');
     assert.deepEqual(parseMarker(body), base().runs);
+  });
 
+  test('a guideline banner diff is capped and points at the commit', () => {
     const huge = base();
     huge.kept[1].flags[0].detail = '+x\n'.repeat(40_000);
-    const cut = renderPrBody(huge);
-    assert.ok(cut.length <= PR_BODY_MAX);
-    assert.match(cut, /\(truncated\)/);
-    assert.deepEqual(parseMarker(cut), base().runs);
+    const body = renderPrBody(huge);
+    assert.ok(body.length <= PR_BODY_MAX);
+    assert.match(body, /_Diff cut at 8000 characters; the full diff is in the commit\._/);
+    assert.ok(!body.includes('(truncated)'));
+    assert.deepEqual(parseMarker(body), base().runs);
+  });
+
+  test('200 edited and 50 deleted files: under the cap, every deleted path listed, marker intact', () => {
+    const long = 'A reason that goes on for a while about what changed in the code. '.repeat(4);
+    const issues = Array.from({ length: 5 }, (_, i) => ({ severity: 'should', note: `note ${i} `.repeat(30) }));
+    const kept = Array.from({ length: 200 }, (_, i) => ({
+      path: `docs/area-${i}/some-fairly-long-document-name-${i}.md`,
+      action: 'update',
+      reason: long,
+      check: { action: 'proceed', issues },
+      dashesFixed: 1,
+      flags: [{ kind: 'new_urls', detail: [`https://example.com/${i}/${'x'.repeat(80)}`] }],
+    }));
+    const deleted = Array.from({ length: 50 }, (_, i) => ({
+      path: `docs/removed-${i}/the-removed-feature-document-${i}.md`,
+      action: 'delete',
+      reason: long,
+      check: { action: 'proceed', issues },
+      flags: [{ kind: 'broken_inbound_links', detail: [`docs/specs/s${i}.md`] }],
+    }));
+    const runs = [{ at: 't', from: 'a', to: 'b', files: [...kept, ...deleted].map((f) => f.path) }];
+    const outline = [{ pr: null, commits: Array.from({ length: 500 }, (_, i) => ({ short: `c${i}`, subject: `subject ${i}` })) }];
+    const body = renderPrBody({ ...base(), kept, deleted, runs, outline });
+    assert.ok(body.length <= PR_BODY_MAX, `${body.length}`);
+    for (const d of deleted) assert.ok(body.includes(`\`${d.path}\``), d.path);
+    assert.deepEqual(parseMarker(body), runs);
+    assert.ok(!body.includes('(truncated)'));
+
+    const thousands = Array.from({ length: 3000 }, (_, i) => ({ ...kept[0], path: `docs/many/doc-${i}.md` }));
+    const cut = renderPrBody({ ...base(), kept: thousands, deleted, runs, outline });
+    assert.ok(cut.length <= PR_BODY_MAX, `${cut.length}`);
+    for (const d of deleted) assert.ok(cut.includes(`\`${d.path}\``), d.path);
+    assert.match(cut, /more line\(s\) not shown; see the commit/);
+    assert.deepEqual(parseMarker(cut), runs);
   });
 
   test('usage entries carry their cost', () => {
@@ -1122,5 +1449,23 @@ describe('stale edits go back to triage', () => {
     assert.equal(writerPrefix({ ...base, stale: stale() }), triageUser({ ...base, stale: stale() }));
     assert.match(checkerUser({ narrative: 'n', diff: 'd', docs: [], stale: stale() }), /<earlier_diff>/);
     assert.match(TRIAGE_SYSTEM, /<stale_edits> block is present, re-evaluate every doc it lists/);
+  });
+
+  test('a discarded delete is named as a delete, next to discarded edits', () => {
+    const text = renderStaleBlock({ docs: [{ path: 'docs/a.md', kind: 'edit' }, { path: 'docs/b.md', kind: 'delete' }], current: { 'docs/a.md': 'a', 'docs/b.md': 'b' } });
+    assert.match(text, /edit was discarded: docs\/a\.md\n/);
+    assert.match(text, /deleted these docs, but the target branch changed them before the delete merged, so the delete was discarded: docs\/b\.md\n/);
+    assert.match(text, /<stale_doc path="docs\/b\.md">\nb\n<\/stale_doc>/, 'current text included so triage can re-nominate it');
+  });
+});
+
+describe('writer prefix and deletes', () => {
+  test('the prefix lists deletes after everything triage saw, and nothing when there are none', () => {
+    const base = { guidelines: 'g', narrative: 'n', diff: 'd', manifest: 'm' };
+    const prefix = writerPrefix({ ...base, deleted: [{ path: 'docs/gone.md', reason: 'app removed' }] });
+    assert.ok(prefix.startsWith(triageUser(base)));
+    assert.ok(prefix.endsWith('<deleted_this_run>\n- docs/gone.md: app removed\n</deleted_this_run>'));
+    assert.equal(writerPrefix({ ...base, deleted: [] }), triageUser(base));
+    assert.match(WRITER_SYSTEM, /Never link to a doc listed in <deleted_this_run>/);
   });
 });
