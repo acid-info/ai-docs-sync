@@ -323,13 +323,18 @@ async function main() {
       for (const f of plan.restoreDeletes) tombstones.add(f);
       staleCarried.push(...reconciled.stale);
       obsolete.push(...plan.obsolete);
-      for (const d of decisions.filter((x) => x.kind === 'declined-delete')) {
-        const fixups = L.fixupsOfRevertedDelete(d.path, carried, readCheckout);
+      // A doc back in the tree takes back the links an earlier run removed for it.
+      const restored = [
+        ...decisions.filter((x) => x.kind === 'declined-delete').map((x) => [x.path, 'the delete they followed was reverted by a reviewer']),
+        ...reconciled.discarded.map((x) => [x.path, `the reviewer delete they followed was discarded because ${TARGET_BRANCH} changed the file`]),
+      ];
+      for (const [p, reason] of restored) {
+        const fixups = L.fixupsOfRevertedDelete(p, carried, readCheckout);
         for (const q of fixups) {
           carried.delete(q);
-          staleCarried.push({ path: q, kind: 'edit', reason: 'the delete they followed was reverted by a reviewer' });
+          staleCarried.push({ path: q, kind: 'edit', reason });
         }
-        if (fixups.length) revertedFixups.set(d.path, fixups);
+        if (fixups.length) revertedFixups.set(p, fixups);
       }
       log(
         `Open PR #${openPr.number}; carrying forward ${plan.restore.length} unmerged edit(s) and ${plan.restoreDeletes.length} delete(s) from origin/${cfg.branch}` +
@@ -338,7 +343,7 @@ async function main() {
       );
       for (const d of decisions) log(`  reviewer decision: ${L.describeDecision(d)}`);
       for (const d of reconciled.discarded) log(`  reviewer ${d.kind === 'renamed' ? 'rename' : 'delete'} of ${d.path} discarded: ${TARGET_BRANCH} changed the file`);
-      for (const [p, qs] of revertedFixups) log(`  carried link fix-up(s) for ${p}, restored by a reviewer, sent back to triage: ${qs.join(', ')}`);
+      for (const [p, qs] of revertedFixups) log(`  carried link fix-up(s) for ${p}, which is back, sent back to triage: ${qs.join(', ')}`);
     } else {
       log(`origin/${cfg.branch} exists with no open PR into ${TARGET_BRANCH}; its edits are not carried forward`);
     }
@@ -351,6 +356,9 @@ async function main() {
   // The PR must stop showing a discarded or obsolete change even when nothing else changes.
   const mustRefresh = Boolean(openPr && (staleCarried.length || obsolete.length || discardedReviewer.length));
   const reviewerRemoved = new Map(decisions.filter((d) => d.kind === 'deleted' || d.kind === 'renamed').map((d) => [d.path, d]));
+  // New to the target, but the reviewer's rename rather than a doc the tool created.
+  const renamedTo = new Set(decisions.filter((d) => d.kind === 'renamed').map((d) => d.to));
+  const isNewDoc = (p) => !treeEntry(head, p) && !renamedTo.has(p);
   const stalePaths = staleCarried.map((x) => x.path);
 
   // Discarded edits go back to triage with the earlier code changes they documented. Where that
@@ -464,6 +472,7 @@ async function main() {
     diff: packed.diff,
     manifest: L.renderManifest(manifest.filter((m) => !deletedPaths.has(m.path))),
     stale: staleText,
+    reviewer: L.renderReviewerBlock(decisions),
     deleted: [
       ...deletes.map((d) => ({ path: d.path, reason: d.reason })),
       ...[...reviewerRemoved.values()].map((d) => ({ path: d.path, reason: d.kind === 'renamed' ? `renamed by a reviewer to ${d.to}; link there instead` : 'deleted by a reviewer' })),
@@ -595,7 +604,7 @@ async function main() {
   const gone = new Set(gated.kept.filter((k) => k.action === 'delete').map((k) => k.path));
   // An earlier run's create, edited again, is still new to the target.
   const kept = L.markNewDocLinks(
-    gated.kept.filter((k) => k.action !== 'delete').map((k) => (k.action === 'update' && !treeEntry(head, k.path) ? { ...k, action: 'create' } : k)),
+    gated.kept.filter((k) => k.action !== 'delete').map((k) => (k.action === 'update' && isNewDoc(k.path) ? { ...k, action: 'create' } : k)),
     allMarkdown.filter((p) => !keptEdits.has(p) && !gone.has(p)).map((p) => ({ path: p, content: readCurrent(p) }))
   );
   // On the final content, so a link fix-up that was held back still shows.
@@ -634,7 +643,7 @@ async function main() {
   const keptPaths = new Set([...kept, ...keptDeletes].map((k) => k.path));
   for (const { path: p, kind, reason } of staleCarried)
     log(
-      `STALE carried ${kind} discarded, ${reason ?? `target changed ${p}`}; ` +
+      `STALE carried ${kind} of ${p} discarded, ${reason ?? 'target changed the file'}; ` +
         (keptPaths.has(p) ? 'redone this run' : `not reselected (force with since=${L.regenerateFrom(prevRuns, p, carryBase)})`)
     );
   const reviewer = [
@@ -645,7 +654,7 @@ async function main() {
       requeued: (revertedFixups.get(d.path) ?? []).map((q) => ({ path: q, redone: keptPaths.has(q) })),
       flags: reviewerRemoved.has(d.path) && L.isGuidelineFile(d.path, guidelineFiles) ? [{ kind: 'guideline_delete', detail: L.unifiedDiff(readCheckout(d.path) ?? '', '', d.path) }] : [],
     })),
-    ...discardedReviewer.map((d) => ({ kind: 'discarded', path: d.path })),
+    ...discardedReviewer.map((d) => ({ kind: 'discarded', path: d.path, requeued: (revertedFixups.get(d.path) ?? []).map((q) => ({ path: q, redone: keptPaths.has(q) })) })),
   ];
   for (const r of reviewer)
     log(
@@ -685,7 +694,7 @@ async function main() {
     deleted: keptDeletes,
     reviewer,
     carried: [
-      ...carriedOnly.map((p) => ({ path: p, run: L.lastRunFor(prevRuns, p), created: !treeEntry(head, p) })),
+      ...carriedOnly.map((p) => ({ path: p, run: L.lastRunFor(prevRuns, p), created: isNewDoc(p) })),
       ...toolCarriedDeletes.map((p) => ({ path: p, run: L.lastRunFor(prevRuns, p), deleted: true })),
     ],
     stale: staleCarried.filter((x) => !x.reason).map(({ path: p, kind }) => ({ path: p, kind, since: L.regenerateFrom(prevRuns, p, carryBase), redone: keptPaths.has(p) })),

@@ -1918,6 +1918,9 @@ describe('reviewer decisions', () => {
     assert.equal(renderReviewerBlock([]), '');
     assert.ok(triageUser({ narrative: 'n', diff: 'd', manifest: 'm', reviewer: block }).endsWith(block));
     assert.match(TRIAGE_SYSTEM, /<reviewer_decisions>/);
+    assert.match(WRITER_SYSTEM, /keep every existing link to a doc whose delete a\s+reviewer reverted/);
+    const prefix = writerPrefix({ narrative: 'n', diff: 'd', manifest: 'm', reviewer: block, deleted: [{ path: 'docs/a.md', reason: 'deleted by a reviewer' }] });
+    assert.ok(prefix.indexOf(block) > 0 && prefix.indexOf(block) < prefix.indexOf('<deleted_this_run>'));
     const stale = renderStaleBlock({ docs: [{ path: 'docs/index.md', kind: 'edit', reason: 'the delete they followed was reverted by a reviewer' }], from: 'a', to: 'b' });
     assert.match(stale, /the edit was discarded because the delete they followed was reverted by a reviewer: docs\/index\.md/);
     assert.ok(!stale.includes('target branch changed'));
@@ -1930,7 +1933,7 @@ describe('reviewer decisions', () => {
       { kind: 'renamed', path: 'docs/cli.md', to: 'docs/client.md', fixed: ['docs/index.md'] },
       { kind: 'declined-create', path: 'docs/commands/wave.md' },
       { kind: 'declined-delete', path: 'docs/commands/version.md', requeued: [{ path: 'docs/index.md', redone: false }] },
-      { kind: 'discarded', path: 'docs/was.md' },
+      { kind: 'discarded', path: 'docs/was.md', requeued: [{ path: 'README.md', redone: true }] },
     ];
     const body = renderPrBody({
       repo: 'o/r',
@@ -1950,7 +1953,7 @@ describe('reviewer decisions', () => {
     assert.match(section, /- `docs\/cli\.md` renamed to `docs\/client\.md` by a reviewer\. To undo, rename it back on the branch\.\n  - Links to it fixed this run in `docs\/index\.md`/);
     assert.match(section, /- `docs\/commands\/wave\.md` new doc declined by a reviewer; not created again while this PR is open\. To undo, add the file back on the branch\./);
     assert.match(section, /- `docs\/commands\/version\.md` delete reverted by a reviewer; not deleted again while this PR is open\. To undo, delete it again on the branch\.\n  - The carried link fix-up in `docs\/index\.md` was discarded and sent back to triage: not selected again\./);
-    assert.match(section, /- Reviewer delete of `docs\/was\.md` discarded because `main` changed the file; delete it again on the branch if still wanted\./);
+    assert.match(section, /- Reviewer delete of `docs\/was\.md` discarded because `main` changed the file; delete it again on the branch if still wanted\.\n  - The carried link fix-up in `README\.md` was discarded and sent back to triage: redone this run\./);
 
     const many = Array.from({ length: 50 }, (_, i) => ({ kind: 'deleted', path: `docs/reviewer-removed-${i}/a-long-document-name-${i}.md`, fixed: [], linkers: [] }));
     const thousands = Array.from({ length: 3000 }, (_, i) => ({ path: `docs/many/doc-${i}.md`, action: 'update', reason: 'x'.repeat(200), check: { action: 'proceed', issues: [] }, flags: [] }));

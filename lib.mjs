@@ -1214,7 +1214,8 @@ reflects them.
 
 When a <reviewer_decisions> block is present, a human reviewer made those calls on the docs pull
 request and they stand: never nominate a doc a reviewer deleted or renamed away, never "create" a
-doc a reviewer declined, and never "delete" a doc whose delete a reviewer reverted.`;
+doc a reviewer declined or one that would take over what a reviewer deleted, and never "delete" a
+doc whose delete a reviewer reverted, nor ask for links to it to be removed.`;
 
 // Triage otherwise sees no doc bodies, so `current` carries them (null when too large). `diff` is
 // empty when the earlier code changes are already inside the range.
@@ -1346,6 +1347,9 @@ Rules:
 - Never link to a doc listed in <deleted_this_run>. When the task says to remove a link to one,
   remove the link or retarget it to a surviving doc from the manifest, and adjust the sentence
   around it so it still reads.
+- <reviewer_decisions>, when present, are a human reviewer's calls on this pull request. Never
+  link to a doc a reviewer declined, and keep every existing link to a doc whose delete a
+  reviewer reverted: the reviewer wants that doc kept and reachable.
 ${HOUSE_STYLE}
 ${UNTRUSTED}
 
@@ -1359,8 +1363,8 @@ export function renderDeletedBlock(deleted = []) {
 }
 
 // Byte-identical across every writer call of a run; the cache breakpoint sits after it.
-export function writerPrefix({ guidelines, narrative, diff, manifest, stale = '', deleted = [] }) {
-  return [triageUser({ guidelines, narrative, diff, manifest, stale }), renderDeletedBlock(deleted)].filter(Boolean).join('\n\n');
+export function writerPrefix({ guidelines, narrative, diff, manifest, stale = '', reviewer = '', deleted = [] }) {
+  return [triageUser({ guidelines, narrative, diff, manifest, stale, reviewer }), renderDeletedBlock(deleted)].filter(Boolean).join('\n\n');
 }
 
 function truncateTokens(text, tokens) {

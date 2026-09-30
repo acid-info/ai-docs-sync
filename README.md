@@ -244,10 +244,12 @@ just as it is never edited.
     deletes.
   - Renaming a doc works the same way for the old path; links to it are retargeted to the new one.
   - Deleting a doc the branch added (usually one the tool created) stops the tool creating it again.
-  - Restoring a doc the tool deleted stops the tool deleting it again. The carried link fix-ups
-    that followed that delete are discarded and go back to triage with their current text.
+  - Restoring a doc the tool deleted stops the tool deleting it again, and the writer keeps links
+    to it. The carried link fix-ups that followed that delete are discarded and go back to triage
+    with the target's text.
   - If the target changes a doc a reviewer deleted, the delete is discarded and reported; delete
-    it again on the branch if it is still wanted.
+    it again on the branch if it is still wanted. Its carried link fix-ups go back to triage the
+    same way.
 
   Every run rebuilds the branch, which drops the reviewers' commits, so the tool records these
   decisions in a `Reviewer decisions:` section of its own commit message and reads them back on
