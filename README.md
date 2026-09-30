@@ -2,8 +2,9 @@
 
 Shared automation that keeps a repo's documentation in step with its code. On every push to a
 repo's target branch it reads the code diff together with the commit messages and any linked
-PRs, decides which docs are affected, rewrites them with one model, has a second model check the
-rewrite, runs mechanical gates, and maintains a single rolling pull request with the result.
+PRs, decides which docs are affected, rewrites (or deletes) them with one model, has a second
+model check the result, runs mechanical gates, and maintains a single rolling pull request with
+it.
 Humans merge it.
 
 Consumers call this repo as a **reusable workflow** pinned to `@v1`. Upgrading the tool or
@@ -27,10 +28,12 @@ swapping a model is one edit here, not one per consumer.
    just what.
 5. Free exits first: a push that touches only docs (including merging the rolling PR) stops
    before any API call.
-6. Triage picks the affected docs. A writer model rewrites each one, a checker model reviews
-   the rewrite and can demand at most one correction pass.
-7. Mechanical gates run on every edit: the path allowlist, resolution of added links, dash and
-   attribution scans, size sanity, a banner for guideline-file edits, optional prettier.
+6. Triage picks the docs to update, create or delete. A writer model rewrites each one, a
+   checker model reviews every rewrite and delete and can demand at most one correction pass of
+   a rewrite, or drop a delete. Every affected doc is written; there is no per-run cap.
+7. Mechanical gates run on every change: the path allowlist, resolution of added links against
+   the post-edit tree, dash and attribution scans, size sanity, a banner for guideline-file edits
+   and deletes, optional prettier.
 8. The result is pushed to one rolling branch and one rolling PR per repo, updated in place.
    Edits not yet merged survive the next run. The cursor advances whatever the outcome.
 
@@ -140,7 +143,6 @@ key.
 | `branch` | Rolling branch name. Default `docs/repo/sync`. Refused if it names the target or default branch. |
 | `narrative_max_tokens` | Budget for commit and PR messages fed to the models. Default `6000`. |
 | `label` | Label on the rolling PR. Default `docs-sync`. |
-| `max_docs_per_run` | Writer calls per run; the rest are listed in the PR body. Default `8`. |
 | `format_check` | `off` (default) or `strict`. `strict` needs `setup_command`. |
 | `setup_command` | Shell run before prettier, e.g. `corepack enable && pnpm install --frozen-lockfile`. |
 
@@ -174,8 +176,11 @@ Built-in ignores cover lockfiles, `*.min.js`, `*.map`, `dist/`, `vendor/`, `__sn
 `*.generated.*`.
 
 Guideline files (`AGENTS.md`, `CLAUDE.md`, anything in `guidelines_files`) are editable like any
-other doc when `doc_paths` covers them. An edit to one gets a banner at the top of the PR body
-with the full diff inline. A repo that wants them hand-maintained lists them in `never_touch`.
+other doc when `doc_paths` covers them. An edit or delete of one gets a banner at the top of the
+PR body with the diff inline. A repo that wants them hand-maintained lists them in `never_touch`.
+
+Deletes are always on; there is no key for them. A doc listed in `never_touch` is never deleted,
+just as it is never edited.
 
 ## The rolling PR
 
@@ -183,27 +188,41 @@ with the full diff inline. A repo that wants them hand-maintained lists them in 
   holding every edit still open. That commit is built with git plumbing in a throwaway index,
   so the working tree never changes. It is pushed with `--force-with-lease` pinned to the
   branch state the tool inspected.
-- **Carry-forward.** While a PR from the rolling branch into the target is open, its edits are
-  carried into the next run. If the target has since changed one of those files, that edit is
-  discarded and the file goes back to triage together with the earlier code changes the edit
-  documented. Triage can select it again, in which case the edit is redone on top of the
-  target's new version. Either way the PR is updated, so it never keeps a conflicting edit. After
-  the PR is merged or closed nothing is carried: merged edits are already in the target, and
-  closing means "not now". The next publishing run opens a fresh PR on the same branch.
+- **Carry-forward.** While a PR from the rolling branch into the target is open, its edits and
+  deletes are carried into the next run. If the target has since changed one of those files,
+  that edit or delete is discarded and the file goes back to triage together with the earlier
+  code changes the edit documented. Triage can select it again, in which case the edit (or the
+  delete) is redone on top of the target's new version. If the target deleted the file itself,
+  the carried change is dropped. Either way the PR is updated, so it never keeps a conflicting
+  change. A new nomination wins over a carried one: an update of a carried delete restores the
+  doc, a delete of a carried edit replaces the edit. After the PR is merged or closed nothing is
+  carried: merged changes are already in the target, and closing means "not now". The next
+  publishing run opens a fresh PR on the same branch.
+- **Deletes.** Triage nominates a delete only when a doc's whole subject is gone from the code (a
+  removed app, package, feature, command, endpoint or config area), citing the diff files that
+  removed it. A delete whose cited files are not in the diff is listed as a suggested deletion and
+  not acted on. The checker confirms or drops every delete. Editable docs that link to a deleted
+  doc get their links removed or retargeted in the same run; links from docs the tool may not
+  edit are listed under the delete. Each delete links to the target's copy of the file, for
+  restoring it.
 - **Ownership.** The branch may hold, besides the tool's commits, merges (the PR's "Update
-  branch" button) and other people's commits that only add or edit editable docs (a reviewer's
-  suggestion); those edits are carried forward like the tool's own. Any other commit (code, a
-  deleted or renamed doc), or a branch the tool never committed to, makes the run refuse before
-  any paid call. Rename or delete that branch.
-- The PR body lists, per file: the triage reason, the checker's verdict and issues, and whether
-  a correction pass addressed them. It also lists carried edits, discarded edits and whether
-  they were redone, held-back files and the gate that stopped them, new links and raw HTML,
-  delete candidates, triage overflow, the commits and PRs in the range, and API cost. A
-  guideline-file edit is bannered at the top with its full diff.
+  branch" button) and other people's commits that only add, edit or delete editable docs (a
+  reviewer's suggestion, or removing a doc the tool created). A rename between two editable paths
+  counts as a delete plus an addition. Those changes are carried forward like the tool's own. Any
+  other commit (code, a non-doc file, a path outside the allowlist), or a branch the tool never
+  committed to, makes the run refuse before any paid call. Rename or delete that branch.
+- The PR body lists deleted docs first, then edited ones, per file: the triage reason, the
+  checker's verdict and issues, and whether a correction pass addressed them. It also lists
+  carried changes, discarded ones and whether they were redone, held-back files and the gate that
+  stopped them, new links and raw HTML, suggested deletions, the commits and PRs in the range, and
+  API cost. A guideline-file edit or delete is bannered at the top with its diff, capped at 8,000
+  characters.
 - Everything model- or narrative-derived in the body is defused: no live `@mentions`, no
-  closing keywords, no raw HTML. The body is capped at 60,000 characters. A hidden
-  `<!-- ai-docs-sync {...} -->` marker keeps the last 20 runs; it is informational only and
-  never drives control flow.
+  closing keywords, no raw HTML. The body is capped at 60,000 characters: over it, detail is
+  shed in steps (narrative, checker notes, flags, per-file detail, then non-deleted file lines),
+  and the list of deleted paths is never cut. A hidden `<!-- ai-docs-sync {...} -->` marker keeps
+  up to the last 20 runs within 20,000 characters, oldest dropped first; it is informational only
+  and never drives control flow.
 - A `docs-sync/gates` commit status marks the branch head, because a PR pushed with
   `GITHUB_TOKEN` runs no CI.
 
@@ -307,10 +326,14 @@ dispatched directly. End-to-end changes have to be proved on a real push in a co
 - The job checks out the consumer's **target branch**, never a PR head. Config, guidelines, docs
   and the tool are trusted code. The diff, commit messages and PR bodies arrive as data and are
   only ever placed in user turns.
-- The tool can only write `.md` files inside `doc_paths` minus `never_touch` minus a built-in
-  denylist, checked on the canonicalised path (no `..`, no absolute, no symlink component) after
-  every model call. A prompt-injected diff can, at worst, produce a bad doc edit in the rolling
-  PR, which a human reviews.
+- The tool can only write or delete `.md` files inside `doc_paths` minus `never_touch` minus a
+  built-in denylist, checked on the canonicalised path (no `..`, no absolute, no symlink
+  component) after every model call. A prompt-injected diff can, at worst, produce a bad doc edit
+  or delete in the rolling PR, which a human reviews.
+- A delete needs a cited source file that is in the code diff; narrative text alone (a commit
+  message claiming a feature was removed) never deletes a doc. Guideline-file deletes are
+  bannered like guideline edits. There is no per-run cap on edits or deletes: the rolling branch
+  and the required human merge are the guard.
 - The tool may edit its own instruction source (`AGENTS.md`, `CLAUDE.md`, `guidelines_files`)
   when `doc_paths` covers it. Such an edit is bannered at the top of the PR body with its full
   diff, and the writer loads the target branch's copy of the guidelines, never a draft from the
@@ -318,7 +341,8 @@ dispatched directly. End-to-end changes have to be proved on a real push in a co
 - The cursor is a git ref, movable only with `contents: write`. Nothing read from a PR body
   drives control flow; the rolling PR is located by head and base, not by marker.
 - The force-push target is validated (not the target or default branch, safe charset) and the
-  existing branch must hold nothing but the tool's commits, merges and doc additions or edits.
+  existing branch must hold nothing but the tool's commits, merges and doc additions, edits or
+  deletes.
 - No write credential is persisted in the checkout. The token and API keys are removed from the
   tool's environment at startup, so they are not passed to `setup_command`, prettier or git.
   Only the push and cursor-update child processes receive the token, via environment, and they
