@@ -207,7 +207,8 @@ just as it is never edited.
   delete) is redone on top of the target's new version. If the target deleted the file itself,
   the carried change is dropped. Either way the PR is updated, so it never keeps a conflicting
   change. A new nomination wins over a carried one: an update of a carried delete restores the
-  doc, a delete of a carried edit replaces the edit. After the PR is merged or closed nothing is
+  doc, a delete of a carried edit replaces the edit. A reviewer's decision is the exception (see
+  "Reviewer changes" below): the tool never undoes it. After the PR is merged or closed nothing is
   carried: merged changes are already in the target, and closing means "not now". The next
   publishing run opens a fresh PR on the same branch.
 - **Deletes.** Triage nominates a delete only when a doc's whole subject is gone from the code (a
@@ -229,14 +230,32 @@ just as it is never edited.
   run edits it.
   To reject a new doc, delete it on the rolling branch and revert the index doc's link to it in
   the same commit: carried changes are not re-checked, so a link left behind stays broken in the
-  PR. Closing the rolling PR also works, but drops every unmerged change on it.
+  PR. The tool does not create that doc again while the PR stays open.
 - **Ownership.** The branch may hold, besides the tool's commits, merges (the PR's "Update
-  branch" button) and other people's commits that only add, edit or delete editable docs (a
-  reviewer's suggestion, or removing a doc the tool created). A rename between two editable paths
-  counts as a delete plus an addition. Those changes are carried forward like the tool's own. Any
-  other commit (code, a non-doc file, a path outside the allowlist), or a branch the tool never
+  branch" button) and other people's commits that only add, edit, delete or rename editable docs
+  (a reviewer's suggestion, removing a doc, restoring one the tool deleted). A rename counts only
+  when both paths are editable. Those changes are carried forward like the tool's own. Any other
+  commit (code, a non-doc file, a path outside the allowlist), or a branch the tool never
   committed to, makes the run refuse before any paid call. Rename or delete that branch.
-- The PR body lists deleted docs first, then new ones, then edited ones, per file: the triage reason, the
+- **Reviewer changes.** A reviewer's decision on the branch beats the tool's, for as long as the
+  PR stays open:
+  - Deleting a doc the target has keeps it deleted. Triage nominations for it are dropped, and
+    editable docs that link to it get their links removed or retargeted, as for the tool's own
+    deletes.
+  - Renaming a doc works the same way for the old path; links to it are retargeted to the new one.
+  - Deleting a doc the branch added (usually one the tool created) stops the tool creating it again.
+  - Restoring a doc the tool deleted stops the tool deleting it again. The carried link fix-ups
+    that followed that delete are discarded and go back to triage with their current text.
+  - If the target changes a doc a reviewer deleted, the delete is discarded and reported; delete
+    it again on the branch if it is still wanted.
+
+  Every run rebuilds the branch, which drops the reviewers' commits, so the tool records these
+  decisions in a `Reviewer decisions:` section of its own commit message and reads them back on
+  the next run, rechecked against the branch. The PR body lists them under "Reviewer changes on
+  this branch", each with how to undo it. To undo one, reverse it on the branch: restore the file
+  you deleted, or delete again the file you restored. After the PR is merged or closed no decision
+  carries, like any other change.
+- The PR body lists deleted docs first, then reviewer changes, then new docs, then edited ones, per file: the triage reason, the
   checker's verdict and issues, and whether a correction pass addressed them. It also lists
   carried changes, discarded ones and whether they were redone, held-back files and the gate that
   stopped them, new links and raw HTML, suggested deletions, the commits and PRs in the range, and
@@ -245,7 +264,7 @@ just as it is never edited.
 - Everything model- or narrative-derived in the body is defused: no live `@mentions`, no
   closing keywords, no raw HTML. The body is capped at 60,000 characters: over it, detail is
   shed in steps (narrative, checker notes, flags, per-file detail, then non-deleted file lines),
-  and the list of deleted paths is never cut. A hidden `<!-- ai-docs-sync {...} -->` marker keeps
+  and the lists of deleted paths and reviewer changes are never cut. A hidden `<!-- ai-docs-sync {...} -->` marker keeps
   up to the last 20 runs within 20,000 characters, oldest dropped first; it is informational only
   and never drives control flow.
 - A `docs-sync/gates` commit status marks the branch head, because a PR pushed with
@@ -366,8 +385,12 @@ dispatched directly. End-to-end changes have to be proved on a real push in a co
 - The cursor is a git ref, movable only with `contents: write`. Nothing read from a PR body
   drives control flow; the rolling PR is located by head and base, not by marker.
 - The force-push target is validated (not the target or default branch, safe charset) and the
-  existing branch must hold nothing but the tool's commits, merges and doc additions, edits or
-  deletes.
+  existing branch must hold nothing but the tool's commits, merges and additions, edits,
+  deletions or renames of editable docs.
+- The `Reviewer decisions:` lines in the tool's commit message can be forged by anyone who can
+  push to the rolling branch. That is harmless by construction: a decision can only stop the tool
+  from writing, recreating or deleting a doc, never make it write one. Every path is checked
+  against the allowlist, and every decision against the branch's tree, before it is used.
 - No write credential is persisted in the checkout. The token and API keys are removed from the
   tool's environment at startup, so they are not passed to `setup_command`, prettier or git.
   Only the push and cursor-update child processes receive the token, via environment, and they

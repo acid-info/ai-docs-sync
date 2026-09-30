@@ -276,8 +276,12 @@ async function main() {
   const openPr = await findOpenPr();
   const carried = new Map(); // path -> { mode, blob, content }
   const tombstones = new Set(); // docs the rolling branch deletes
-  const staleCarried = []; // { path, kind }
+  const staleCarried = []; // { path, kind, reason? }
   const obsolete = [];
+  // Reviewer decisions, recorded in the tool's commit because every rebuild drops the reviewers' commits.
+  let decisions = [];
+  const discardedReviewer = [];
+  const revertedFixups = new Map(); // restored doc -> carried fix-ups sent back to triage
   let carryBase = null;
   const remote = `refs/remotes/origin/${cfg.branch}`;
   // The lease for the force push: what we inspected, or "must not exist".
@@ -285,13 +289,11 @@ async function main() {
   if (remoteSha) {
     const base = git(['merge-base', 'HEAD', remote]);
     const branchCommits = L.parseGitLog(git(['log', `--format=${L.GIT_LOG_FORMAT}`, `${base}..${remote}`]));
-    const foreign = L.foreignBranchCommit(branchCommits, {
-      changesOf: (sha) => L.parseNameStatus(git(['diff-tree', '--no-commit-id', '--name-status', '-r', '-z', '--no-renames', sha])),
-      isEditableDoc,
-    });
+    const changesOf = (sha) => L.parseNameStatus(git(['diff-tree', '--no-commit-id', '--name-status', '-r', '-z', '-M', sha]));
+    const foreign = L.foreignBranchCommit(branchCommits, { changesOf, isEditableDoc });
     if (foreign)
       throw new Error(
-        `origin/${cfg.branch} has ${foreign.short} "${foreign.subject}" (${foreign.email}), which is neither the tool's nor a doc addition, edit or delete; ` +
+        `origin/${cfg.branch} has ${foreign.short} "${foreign.subject}" (${foreign.email}), which is neither the tool's nor an addition, edit, deletion or rename of an editable doc; ` +
           `refusing to build on it. Rename or delete that branch.`
       );
     if (openPr) {
@@ -302,15 +304,41 @@ async function main() {
         targetChangedSinceBase: (f) => !gitOk(['diff', '--quiet', base, 'HEAD', '--', f]),
         isEditableDoc,
       });
+      const lastTool = branchCommits.find(L.isToolCommit);
+      const reconciled = L.reconcileReviewerCarry({
+        decisions: L.classifyReviewerChanges({
+          commits: [...branchCommits].reverse(),
+          changesOf,
+          baseHas: (f) => treeEntry(base, f) != null,
+          remoteHas: (f) => treeEntry(remote, f) != null,
+          isEditableDoc,
+          previous: lastTool ? L.parseReviewerDecisions(`${lastTool.subject}\n\n${lastTool.body}`, isEditableDocPath) : [],
+        }),
+        stale: plan.stale,
+        obsolete: plan.obsolete,
+      });
+      decisions = reconciled.decisions;
+      discardedReviewer.push(...reconciled.discarded);
       for (const f of plan.restore) carried.set(f, { ...treeEntry(remote, f), content: git(['show', `${remote}:${f}`], { raw: true }) });
       for (const f of plan.restoreDeletes) tombstones.add(f);
-      staleCarried.push(...plan.stale);
+      staleCarried.push(...reconciled.stale);
       obsolete.push(...plan.obsolete);
+      for (const d of decisions.filter((x) => x.kind === 'declined-delete')) {
+        const fixups = L.fixupsOfRevertedDelete(d.path, carried, readCheckout);
+        for (const q of fixups) {
+          carried.delete(q);
+          staleCarried.push({ path: q, kind: 'edit', reason: 'the delete they followed was reverted by a reviewer' });
+        }
+        if (fixups.length) revertedFixups.set(d.path, fixups);
+      }
       log(
         `Open PR #${openPr.number}; carrying forward ${plan.restore.length} unmerged edit(s) and ${plan.restoreDeletes.length} delete(s) from origin/${cfg.branch}` +
           (plan.stale.length ? `; ${plan.stale.length} stale (target changed): ${plan.stale.map((x) => `${x.path} (${x.kind})`).join(', ')}` : '') +
           (plan.obsolete.length ? `; ${plan.obsolete.length} obsolete (target deleted the file): ${plan.obsolete.join(', ')}` : '')
       );
+      for (const d of decisions) log(`  reviewer decision: ${L.describeDecision(d)}`);
+      for (const d of reconciled.discarded) log(`  reviewer ${d.kind === 'renamed' ? 'rename' : 'delete'} of ${d.path} discarded: ${TARGET_BRANCH} changed the file`);
+      for (const [p, qs] of revertedFixups) log(`  carried link fix-up(s) for ${p}, restored by a reviewer, sent back to triage: ${qs.join(', ')}`);
     } else {
       log(`origin/${cfg.branch} exists with no open PR into ${TARGET_BRANCH}; its edits are not carried forward`);
     }
@@ -321,7 +349,8 @@ async function main() {
   const readCurrent = (p) => (carried.has(p) ? carried.get(p).content : isTombstone(p) ? null : readCheckout(p));
   const prevRuns = L.parseMarker(openPr?.body);
   // The PR must stop showing a discarded or obsolete change even when nothing else changes.
-  const mustRefresh = Boolean(openPr && (staleCarried.length || obsolete.length));
+  const mustRefresh = Boolean(openPr && (staleCarried.length || obsolete.length || discardedReviewer.length));
+  const reviewerRemoved = new Map(decisions.filter((d) => d.kind === 'deleted' || d.kind === 'renamed').map((d) => [d.path, d]));
   const stalePaths = staleCarried.map((x) => x.path);
 
   // Discarded edits go back to triage with the earlier code changes they documented. Where that
@@ -382,20 +411,24 @@ async function main() {
   };
 
   // 5.7 triage
-  const triageText = L.triageUser({ guidelines: guidelines.text, narrative, diff: packed.diff, manifest: manifestText, stale: staleText });
+  const triageText = L.triageUser({ guidelines: guidelines.text, narrative, diff: packed.diff, manifest: manifestText, stale: staleText, reviewer: L.renderReviewerBlock(decisions) });
   const triageRaw = await callModel(models.triage, 'triage', { system: L.TRIAGE_SYSTEM, blocks: [{ text: triageText }], maxTokens: cfg.response_max_tokens });
   const triage = L.parseTriage(triageRaw.text, { isEditableDocPath, exists: (p) => readCurrent(p) != null || tombstones.has(p) });
   if (!triage) throw new Error('triage returned unparseable output (run with DEBUG=1 to see it)');
   for (const d of triage.dropped) warn(`triage named "${d.path}": ${d.reason}; dropped`);
-  for (const a of [...triage.affected, ...triage.deletes]) if (tombstones.has(a.path)) undeleted.add(a.path);
+  // A reviewer's decision beats triage, even a nomination that would undo a carried delete.
+  const ruled = L.applyReviewerDecisions({ affected: triage.affected, deletes: triage.deletes, decisions });
+  for (const d of ruled.dropped) log(`  triage ${d.action} of ${d.path} dropped: ${d.reason}`);
+  for (const a of [...ruled.affected, ...ruled.deletes]) if (tombstones.has(a.path)) undeleted.add(a.path);
 
   const codePaths = new Set([...classified.code.flatMap((c) => [c.path, c.oldPath]).filter(Boolean), ...earlierPaths]);
-  const delPlan = L.planDeletes({ deletes: triage.deletes, codePaths, readCurrent, guidelineFiles });
+  const delPlan = L.planDeletes({ deletes: ruled.deletes, codePaths, readCurrent, guidelineFiles });
   const markdownNow = () => allMarkdown.map((p) => ({ path: p, content: readCurrent(p) }));
   const linkPlan = L.applyInboundLinks({
-    affected: triage.affected,
+    affected: ruled.affected,
     deletes: delPlan.deletes,
-    inbound: L.inboundLinks(markdownNow(), delPlan.deletes.map((d) => d.path)),
+    reviewer: [...reviewerRemoved.values()],
+    inbound: L.inboundLinks(markdownNow(), [...delPlan.deletes.map((d) => d.path), ...reviewerRemoved.keys()]),
     isEditableDoc,
   });
   const deletes = linkPlan.deletes;
@@ -412,6 +445,7 @@ async function main() {
     log(`  create ${c.path}: placement ok; exemplar ${c.exemplar?.path ?? '(none)'}; index ${c.index ?? '(none, will be flagged)'}`);
   for (const r of createPlan.refused) log(`  create ${r.path}: held back, ${r.reason}`);
   for (const t of indexTasks) log(`  index update ${t.path} (second wave) links ${t.dependsOn.join(', ')}`);
+  for (const [p, qs] of linkPlan.reviewerFixups) log(`  link fix-up(s) for ${p} (${reviewerRemoved.get(p).kind} by a reviewer): ${qs.join(', ')}`);
   if (!tasks.length && !deletes.length) log(`  ${triage.unaffectedReason || 'no reason given'}`);
   if (TRIAGE_ONLY) {
     log(`TRIAGE_ONLY set; stopping. ${costLine(usage)}`);
@@ -430,7 +464,10 @@ async function main() {
     diff: packed.diff,
     manifest: L.renderManifest(manifest.filter((m) => !deletedPaths.has(m.path))),
     stale: staleText,
-    deleted: deletes.map((d) => ({ path: d.path, reason: d.reason })),
+    deleted: [
+      ...deletes.map((d) => ({ path: d.path, reason: d.reason })),
+      ...[...reviewerRemoved.values()].map((d) => ({ path: d.path, reason: d.kind === 'renamed' ? `renamed by a reviewer to ${d.to}; link there instead` : 'deleted by a reviewer' })),
+    ],
   });
   const patchByPath = new Map(patches.map((p) => [p.path, p]));
   const fits = (a) => {
@@ -562,13 +599,11 @@ async function main() {
     allMarkdown.filter((p) => !keptEdits.has(p) && !gone.has(p)).map((p) => ({ path: p, content: readCurrent(p) }))
   );
   // On the final content, so a link fix-up that was held back still shows.
-  const keptDeletes = L.flagBrokenInbound(
-    gated.kept.filter((k) => k.action === 'delete'),
-    L.inboundLinks(
-      [...new Set([...allMarkdown, ...keptEdits.keys()])].map((p) => ({ path: p, content: keptEdits.has(p) ? keptEdits.get(p) : readCurrent(p) })),
-      gated.kept.filter((k) => k.action === 'delete').map((k) => k.path)
-    )
+  const finalInbound = L.inboundLinks(
+    [...new Set([...allMarkdown, ...keptEdits.keys()])].map((p) => ({ path: p, content: keptEdits.has(p) ? keptEdits.get(p) : readCurrent(p) })),
+    [...gone, ...reviewerRemoved.keys()]
   );
+  const keptDeletes = L.flagBrokenInbound(gated.kept.filter((k) => k.action === 'delete'), finalInbound);
 
   // ------------------------------------------------------------- summary ---
 
@@ -597,8 +632,28 @@ async function main() {
   for (const d of dropped) log(`DROP ${d.path} -- gate ${d.gate}: ${d.reason}`);
   for (const h of heldBack) log(`HELD ${h.path} -- ${h.reason}`);
   const keptPaths = new Set([...kept, ...keptDeletes].map((k) => k.path));
-  for (const { path: p, kind } of staleCarried)
-    log(`STALE carried ${kind} discarded, target changed ${p}; ` + (keptPaths.has(p) ? 'redone this run' : `not reselected (force with since=${L.regenerateFrom(prevRuns, p, carryBase)})`));
+  for (const { path: p, kind, reason } of staleCarried)
+    log(
+      `STALE carried ${kind} discarded, ${reason ?? `target changed ${p}`}; ` +
+        (keptPaths.has(p) ? 'redone this run' : `not reselected (force with since=${L.regenerateFrom(prevRuns, p, carryBase)})`)
+    );
+  const reviewer = [
+    ...decisions.map((d) => ({
+      ...d,
+      fixed: (linkPlan.reviewerFixups.get(d.path) ?? []).filter((q) => keptEdits.has(q)),
+      linkers: [...(finalInbound.get(d.path) ?? [])].sort(),
+      requeued: (revertedFixups.get(d.path) ?? []).map((q) => ({ path: q, redone: keptPaths.has(q) })),
+      flags: reviewerRemoved.has(d.path) && L.isGuidelineFile(d.path, guidelineFiles) ? [{ kind: 'guideline_delete', detail: L.unifiedDiff(readCheckout(d.path) ?? '', '', d.path) }] : [],
+    })),
+    ...discardedReviewer.map((d) => ({ kind: 'discarded', path: d.path })),
+  ];
+  for (const r of reviewer)
+    log(
+      `REVIEWER ${r.kind === 'discarded' ? `delete of ${r.path} discarded, ${TARGET_BRANCH} changed the file` : L.describeDecision(r)}` +
+        (r.fixed?.length ? `; links fixed in ${r.fixed.join(', ')}` : '') +
+        (r.linkers?.length ? `; still linked from ${r.linkers.join(', ')}` : '') +
+        (r.requeued?.length ? `; fix-ups sent back to triage: ${r.requeued.map((q) => `${q.path} (${q.redone ? 'redone' : 'not reselected'})`).join(', ')}` : '')
+    );
   for (const p of obsolete) log(`OBSOLETE carried change dropped, target deleted ${p}`);
   for (const d of delPlan.suggested) log(`SUGGESTED deletion (not acted on): ${d.path} -- ${d.reason} (${d.why})`);
   if (carried.size) log(`CARRIED forward from earlier runs: ${[...carried.keys()].join(', ')}`);
@@ -616,6 +671,7 @@ async function main() {
   const scope = L.commitScope(cfg.branch);
   const carriedOnly = [...carried.keys()].filter((p) => !keptPaths.has(p));
   const carriedDeletesOnly = [...tombstones].filter((p) => !keptPaths.has(p));
+  const toolCarriedDeletes = carriedDeletesOnly.filter((p) => !reviewerRemoved.has(p));
   const title = L.prTitle({ scope, target: TARGET_BRANCH, to: head });
   const prBody = L.renderPrBody({
     repo: REPO,
@@ -627,11 +683,12 @@ async function main() {
     runUrl: RUN_URL,
     kept,
     deleted: keptDeletes,
+    reviewer,
     carried: [
       ...carriedOnly.map((p) => ({ path: p, run: L.lastRunFor(prevRuns, p), created: !treeEntry(head, p) })),
-      ...carriedDeletesOnly.map((p) => ({ path: p, run: L.lastRunFor(prevRuns, p), deleted: true })),
+      ...toolCarriedDeletes.map((p) => ({ path: p, run: L.lastRunFor(prevRuns, p), deleted: true })),
     ],
-    stale: staleCarried.map(({ path: p, kind }) => ({ path: p, kind, since: L.regenerateFrom(prevRuns, p, carryBase), redone: keptPaths.has(p) })),
+    stale: staleCarried.filter((x) => !x.reason).map(({ path: p, kind }) => ({ path: p, kind, since: L.regenerateFrom(prevRuns, p, carryBase), redone: keptPaths.has(p) })),
     dropped,
     heldBack,
     suggestedDeletes: delPlan.suggested,
@@ -648,6 +705,7 @@ async function main() {
         (carriedOnly.length ? `; carried: ${carriedOnly.join(', ')}` : '') +
         (carriedDeletesOnly.length ? `; carried deletes: ${carriedDeletesOnly.join(', ')}` : '')
     );
+    if (decisions.length) log(`Commit message would record:\n${L.renderReviewerDecisions(decisions).join('\n')}`);
     for (const k of kept) log(`\n${L.unifiedDiff(k.current ?? '', k.content, k.path) || `(no textual diff for ${k.path})`}`);
     for (const d of keptDeletes) log(`\n${L.unifiedDiff(d.current, '', d.path) || `(${d.path} is empty; deleted)`}`);
     log(`\n----- PR title -----\n${title}\n----- PR body -----\n${prBody}`);
@@ -687,7 +745,9 @@ async function main() {
       files: kept.map((k) => k.path),
       deleted: keptDeletes.map((d) => d.path),
       carried: carriedOnly,
-      carriedDeleted: carriedDeletesOnly,
+      carriedDeleted: toolCarriedDeletes,
+      reviewerDeleted: carriedDeletesOnly.filter((p) => reviewerRemoved.has(p)),
+      decisions,
       runUrl: RUN_URL,
     }),
     env: { GIT_AUTHOR_NAME: L.BOT_NAME, GIT_AUTHOR_EMAIL: L.BOT_EMAIL, GIT_COMMITTER_NAME: L.BOT_NAME, GIT_COMMITTER_EMAIL: L.BOT_EMAIL },
@@ -733,7 +793,9 @@ async function main() {
       body: {
         state: 'success',
         context: L.STATUS_CONTEXT,
-        description: `${kept.filter((k) => k.action === 'create').length} new, ${kept.filter((k) => k.action !== 'create').length} edited, ${keptDeletes.length} deleted, ${dropped.length + heldBack.length} held back`,
+        description:
+          `${kept.filter((k) => k.action === 'create').length} new, ${kept.filter((k) => k.action !== 'create').length} edited, ${keptDeletes.length} deleted, ${dropped.length + heldBack.length} held back` +
+          (decisions.length ? `, ${decisions.length} reviewer change(s)` : ''),
         ...(RUN_URL ? { target_url: RUN_URL } : {}),
       },
     });
