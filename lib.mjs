@@ -745,7 +745,8 @@ export function applyInboundLinks({ affected, deletes, inbound, isEditableDoc })
   const deletedPaths = new Set(deletes.map((d) => d.path));
   const unfixable = new Map();
   for (const d of deletes) {
-    const note = `remove or retarget the link(s) to ${d.path}, deleted this run because ${d.reason.replace(/[.\s]+$/, '')}`;
+    const why = d.reason.replace(/[.\s]+$/, '').replace(/^[A-Z](?=[a-z])/, (c) => c.toLowerCase());
+    const note = `remove or retarget the link(s) to ${d.path}, deleted this run because ${why}`;
     for (const linker of inbound.get(d.path) ?? []) {
       if (deletedPaths.has(linker)) continue;
       if (!isEditableDoc(linker)) {
