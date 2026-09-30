@@ -398,12 +398,20 @@ async function main() {
     inbound: L.inboundLinks(markdownNow(), delPlan.deletes.map((d) => d.path)),
     isEditableDoc,
   });
-  const tasks = linkPlan.affected;
   const deletes = linkPlan.deletes;
+  const deletedPaths = new Set(deletes.map((d) => d.path));
+  const createPlan = L.planCreates({ affected: linkPlan.affected, manifest, deleted: deletedPaths, isEditable: isEditableDoc, guidelineFiles });
+  const tasks = createPlan.affected;
+  const indexTasks = createPlan.indexTasks;
+  const heldBack = [...createPlan.refused];
   log(`Triage: ${triage.affected.length} affected, ${deletes.length} delete(s)` + (delPlan.suggested.length ? `, ${delPlan.suggested.length} suggested deletion(s)` : ''));
   for (const a of tasks) log(`  ${a.action} ${a.path}: ${a.reason}${a.source_files.length ? ` [${a.source_files.join(', ')}]` : ''}`);
   for (const d of deletes) log(`  delete ${d.path}: ${d.reason} [${d.source_files.join(', ')}]`);
   for (const d of delPlan.suggested) log(`  suggested deletion ${d.path}: ${d.reason} (${d.why})`);
+  for (const c of tasks.filter((a) => a.action === 'create'))
+    log(`  create ${c.path}: placement ok; exemplar ${c.exemplar?.path ?? '(none)'}; index ${c.index ?? '(none, will be flagged)'}`);
+  for (const r of createPlan.refused) log(`  create ${r.path}: held back, ${r.reason}`);
+  for (const t of indexTasks) log(`  index update ${t.path} (second wave) links ${t.dependsOn.join(', ')}`);
   if (!tasks.length && !deletes.length) log(`  ${triage.unaffectedReason || 'no reason given'}`);
   if (TRIAGE_ONLY) {
     log(`TRIAGE_ONLY set; stopping. ${costLine(usage)}`);
@@ -416,7 +424,6 @@ async function main() {
   }
 
   // 5.8 writer, one call per doc, cached prefix, concurrency of three
-  const deletedPaths = new Set(deletes.map((d) => d.path));
   const prefix = L.writerPrefix({
     guidelines: guidelines.text,
     narrative,
@@ -425,17 +432,15 @@ async function main() {
     stale: staleText,
     deleted: deletes.map((d) => ({ path: d.path, reason: d.reason })),
   });
-  const heldBack = [];
   const patchByPath = new Map(patches.map((p) => [p.path, p]));
-  const writable = tasks.filter((a) => {
+  const fits = (a) => {
     const current = readCurrent(a.path);
-    if (current != null && L.approxTokens(current) > cfg.max_doc_tokens) {
-      heldBack.push({ path: a.path, reason: 'too large for a full rewrite in v1' });
-      return false;
-    }
-    return true;
-  });
-  log(`Writer: ${writable.length} call(s) planned` + (heldBack.length ? `, ${heldBack.length} too large` : ''));
+    if (current == null || L.approxTokens(current) <= cfg.max_doc_tokens) return true;
+    heldBack.push({ path: a.path, reason: 'too large for a full rewrite in v1' });
+    return false;
+  };
+  const writable = tasks.filter(fits);
+  log(`Writer: ${writable.length} call(s) planned` + (indexTasks.length ? `, then up to ${indexTasks.length} index update(s)` : '') + (heldBack.length ? `, ${heldBack.length} held back` : ''));
   const docPart = (a) =>
     L.writerDocPart({
       path: a.path,
@@ -443,6 +448,8 @@ async function main() {
       reason: a.reason,
       sourcePatches: a.source_files.flatMap((f) => [earlierByPath.get(f)?.patch, patchByPath.get(f)?.patch]).filter(Boolean).join('\n\n'),
       current: readCurrent(a.path) ?? '',
+      exemplar: a.exemplar ? { path: a.exemplar.path, content: readCurrent(a.exemplar.path) } : null,
+      exemplarTokens: cfg.max_doc_tokens / 2,
     });
   // { content } with content null when unparseable, or { error } once the call's retries are spent.
   const writeDoc = async (a, extra = '') => {
@@ -459,19 +466,30 @@ async function main() {
       return { error };
     }
   };
-  // The first call alone warms the cached prefix; the rest run three at a time against it.
   const drafts = [];
+  const collect = (wave, written) =>
+    wave.forEach((a, i) => {
+      if (written[i].error) heldBack.push({ path: a.path, reason: `writer call failed: ${written[i].error.message}` });
+      else if (written[i].content == null) heldBack.push({ path: a.path, reason: 'writer output could not be parsed as a fenced file' });
+      else drafts.push({ ...a, content: written[i].content, current: readCurrent(a.path) });
+    });
+  // Wave 1, every triage task and link fix-up. The first call alone warms the cached prefix; the
+  // rest run three at a time against it.
   const written = writable.length ? [await writeDoc(writable[0])] : [];
   written.push(...(await L.mapConcurrent(writable.slice(1), cfg.writer_concurrency, (a) => writeDoc(a))));
   // Nothing written and an outage among the causes: fail so the cursor stays put and a later run
   // retries. A request-specific failure (a 400, a timeout) would fail every run, so it is held back.
   if (written.length && written.every((w) => w.error) && written.some((w) => L.isTransientError(w.error)))
     throw written.find((w) => L.isTransientError(w.error)).error;
-  writable.forEach((a, i) => {
-    if (written[i].error) heldBack.push({ path: a.path, reason: `writer call failed: ${written[i].error.message}` });
-    else if (written[i].content == null) heldBack.push({ path: a.path, reason: 'writer output could not be parsed as a fenced file' });
-    else drafts.push({ ...a, content: written[i].content, current: readCurrent(a.path) });
-  });
+  collect(writable, written);
+  // Wave 2, index updates, which need the drafted title of the doc they link.
+  const wave2 = L.finaliseIndexTasks(indexTasks, new Map(drafts.filter((d) => d.action === 'create').map((d) => [d.path, d.content])));
+  heldBack.push(...wave2.orphaned);
+  const writable2 = wave2.tasks.filter(fits);
+  if (writable2.length) {
+    log(`Writer: ${writable2.length} index update(s)`);
+    collect(writable2, await L.mapConcurrent(writable2, cfg.writer_concurrency, (a) => writeDoc(a)));
+  }
   log(`Writer: ${drafts.length} draft(s)` + (heldBack.length ? `, ${heldBack.length} held back` : ''));
 
   // 5.9 checker in batches, then at most one correction per file; a delete is never corrected
@@ -536,8 +554,13 @@ async function main() {
   });
   const { dropped } = gated;
   heldBack.push(...gated.orphaned);
-  const kept = gated.kept.filter((k) => k.action !== 'delete');
-  const keptEdits = new Map(kept.map((k) => [k.path, k.content]));
+  const keptEdits = new Map(gated.kept.filter((k) => k.action !== 'delete').map((k) => [k.path, k.content]));
+  const gone = new Set(gated.kept.filter((k) => k.action === 'delete').map((k) => k.path));
+  // An earlier run's create, edited again, is still new to the target.
+  const kept = L.markNewDocLinks(
+    gated.kept.filter((k) => k.action !== 'delete').map((k) => (k.action === 'update' && !treeEntry(head, k.path) ? { ...k, action: 'create' } : k)),
+    allMarkdown.filter((p) => !keptEdits.has(p) && !gone.has(p)).map((p) => ({ path: p, content: readCurrent(p) }))
+  );
   // On the final content, so a link fix-up that was held back still shows.
   const keptDeletes = L.flagBrokenInbound(
     gated.kept.filter((k) => k.action === 'delete'),
@@ -557,6 +580,7 @@ async function main() {
     else if (k.corrected) notes.push(`corrected after: ${k.check.issues.map((i) => `[${i.severity}] ${i.note}`).join('; ')}`);
     else if (k.check?.issues?.length) notes.push(`checker notes: ${k.check.issues.map((i) => `[${i.severity}] ${i.note}`).join('; ')}`);
     if (k.dashesFixed) notes.push(`${k.dashesFixed} dash line(s) fixed`);
+    if (k.action === 'create') notes.push(k.linkedFrom.length ? `linked from ${k.linkedFrom.join(', ')}` : 'not linked from any doc');
     log(`KEEP ${k.action} ${k.path} -- ${k.reason}` + (notes.length ? `\n     ${notes.join('\n     ')}` : ''));
     for (const f of k.flags) {
       if (f.kind === 'guideline_edit') log(`     FLAG guideline file edited; full diff:\n${f.detail.replace(/^/gm, '       ')}`);
@@ -604,7 +628,7 @@ async function main() {
     kept,
     deleted: keptDeletes,
     carried: [
-      ...carriedOnly.map((p) => ({ path: p, run: L.lastRunFor(prevRuns, p) })),
+      ...carriedOnly.map((p) => ({ path: p, run: L.lastRunFor(prevRuns, p), created: !treeEntry(head, p) })),
       ...carriedDeletesOnly.map((p) => ({ path: p, run: L.lastRunFor(prevRuns, p), deleted: true })),
     ],
     stale: staleCarried.map(({ path: p, kind }) => ({ path: p, kind, since: L.regenerateFrom(prevRuns, p, carryBase), redone: keptPaths.has(p) })),
@@ -709,7 +733,7 @@ async function main() {
       body: {
         state: 'success',
         context: L.STATUS_CONTEXT,
-        description: `${kept.length} edited, ${keptDeletes.length} deleted, ${dropped.length + heldBack.length} held back`,
+        description: `${kept.filter((k) => k.action === 'create').length} new, ${kept.filter((k) => k.action !== 'create').length} edited, ${keptDeletes.length} deleted, ${dropped.length + heldBack.length} held back`,
         ...(RUN_URL ? { target_url: RUN_URL } : {}),
       },
     });

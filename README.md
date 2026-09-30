@@ -29,8 +29,20 @@ swapping a model is one edit here, not one per consumer.
 5. Free exits first: a push that touches only docs (including merging the rolling PR) stops
    before any API call.
 6. Triage picks the docs to update, create or delete. A writer model rewrites each one, a
-   checker model reviews every rewrite and delete and can demand at most one correction pass of
-   a rewrite, or drop a delete. Every affected doc is written; there is no per-run cap.
+   checker model reviews every rewrite, create and delete and can demand at most one correction
+   pass of a rewrite, or drop a create or a delete. Every affected doc is written; there is no
+   per-run cap. A new doc is created when the change adds a user- or developer-facing surface
+   (an app, package, service, CLI command, config area, API, workflow or integration) that no
+   doc covers and that would not fit in an existing one. Before any writer call its path must
+   sit near existing editable docs: in a directory that already holds one, one new directory
+   level under such a directory, or beside a sibling directory's doc of the same name
+   (`packages/new/README.md` next to `packages/old/README.md`). The repo root does not count as
+   a parent or sibling here, so a new top-level directory is always refused. The writer gets an
+   exemplar to follow for structure and tone: the same-named doc in a sibling directory, else
+   the median-sized doc in the same directory, else one in the parent. A second writer wave
+   then links the new doc from an index: the `README.md` or `index.md` in its directory or the
+   parent, else the shortest-path doc that already links into that directory, its parent or a
+   sibling directory.
 7. Mechanical gates run on every change: the path allowlist, resolution of added links against
    the post-edit tree, dash and attribution scans, size sanity, a banner for guideline-file edits
    and deletes, optional prettier.
@@ -205,13 +217,26 @@ just as it is never edited.
   doc get their links removed or retargeted in the same run; links from docs the tool may not
   edit are listed under the delete. Each delete links to the target's copy of the file, for
   restoring it.
+- **New docs.** Creates are always on, with no config key and no cap on how many one run makes:
+  `doc_paths` and `never_touch` decide where a doc may be written, and the human merge is the
+  guard. A create whose path fails the placement check (see "How it works") is held back
+  without a writer call. A create larger than 3x its exemplar is held back when the exemplar is
+  over 400 bytes. The checker drops a create that duplicates the scope of an existing doc or
+  that the diff does not justify. If a new doc is held back, so is the index update that would
+  have linked it. The PR body lists new docs in their own section, above the edits, each with
+  its reason, the checker's verdict and the doc that links to it, or "Not linked from any doc".
+  A new doc carried from an earlier run is marked "(new)", and listed as new again when a later
+  run edits it.
+  To reject a new doc, delete it on the rolling branch and revert the index doc's link to it in
+  the same commit: carried changes are not re-checked, so a link left behind stays broken in the
+  PR. Closing the rolling PR also works, but drops every unmerged change on it.
 - **Ownership.** The branch may hold, besides the tool's commits, merges (the PR's "Update
   branch" button) and other people's commits that only add, edit or delete editable docs (a
   reviewer's suggestion, or removing a doc the tool created). A rename between two editable paths
   counts as a delete plus an addition. Those changes are carried forward like the tool's own. Any
   other commit (code, a non-doc file, a path outside the allowlist), or a branch the tool never
   committed to, makes the run refuse before any paid call. Rename or delete that branch.
-- The PR body lists deleted docs first, then edited ones, per file: the triage reason, the
+- The PR body lists deleted docs first, then new ones, then edited ones, per file: the triage reason, the
   checker's verdict and issues, and whether a correction pass addressed them. It also lists
   carried changes, discarded ones and whether they were redone, held-back files and the gate that
   stopped them, new links and raw HTML, suggested deletions, the commits and PRs in the range, and
