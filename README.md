@@ -1,5 +1,16 @@
 # ai-docs-sync
 
+> [!WARNING]
+> **Deprecated.** ai-docs-sync now lives in
+> [acid-info/ai-tools](https://github.com/acid-info/ai-tools/tree/master/tools/ai-docs-sync) and
+> is no longer maintained here. To migrate, change the `uses:` line of your workflow.
+> `.github/docs-sync.yml` and the secrets stay the same.
+>
+> ```diff
+> - uses: acid-info/ai-docs-sync/.github/workflows/docs-sync.yml@v1
+> + uses: acid-info/ai-tools/.github/workflows/ai-docs-sync.yml@ai-docs-sync/v1
+> ```
+
 Shared automation that keeps a repo's documentation in step with its code. On every push to a
 repo's target branch it reads the code diff together with the commit messages and any linked
 PRs, decides which docs are affected, rewrites (or deletes) them with one model, has a second
